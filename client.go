@@ -253,6 +253,114 @@ func (c *Client) Query(table, field string, value interface{}) ([]uint32, error)
 	return ids, nil
 }
 
+func (c *Client) QueryGT(table, field string, value interface{}, inclusive bool) ([]uint32, error) {
+	valueData, err := encodeValue(value)
+	if err != nil {
+		return nil, err
+	}
+
+	w := NewWriter(nil)
+	w.WriteByte(OpQueryGT)
+	w.WriteString(table)
+	w.WriteString(field)
+	w.WriteBytes(valueData)
+	w.WriteBool(inclusive)
+
+	c.conn.Write(w.Bytes())
+
+	r := NewReader(c.conn)
+	resp, err := ReadResp(r)
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Error)
+	}
+
+	reader := NewReader(bytes.NewReader(resp.Data))
+	count, _ := reader.ReadUint64()
+	ids := make([]uint32, count)
+	for i := uint64(0); i < count; i++ {
+		id, _ := reader.ReadUint64()
+		ids[i] = uint32(id)
+	}
+	return ids, nil
+}
+
+func (c *Client) QueryLT(table, field string, value interface{}, inclusive bool) ([]uint32, error) {
+	valueData, err := encodeValue(value)
+	if err != nil {
+		return nil, err
+	}
+
+	w := NewWriter(nil)
+	w.WriteByte(OpQueryLT)
+	w.WriteString(table)
+	w.WriteString(field)
+	w.WriteBytes(valueData)
+	w.WriteBool(inclusive)
+
+	c.conn.Write(w.Bytes())
+
+	r := NewReader(c.conn)
+	resp, err := ReadResp(r)
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Error)
+	}
+
+	reader := NewReader(bytes.NewReader(resp.Data))
+	count, _ := reader.ReadUint64()
+	ids := make([]uint32, count)
+	for i := uint64(0); i < count; i++ {
+		id, _ := reader.ReadUint64()
+		ids[i] = uint32(id)
+	}
+	return ids, nil
+}
+
+func (c *Client) QueryBetween(table, field string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
+	minData, err := encodeValue(min)
+	if err != nil {
+		return nil, err
+	}
+	maxData, err := encodeValue(max)
+	if err != nil {
+		return nil, err
+	}
+
+	w := NewWriter(nil)
+	w.WriteByte(OpQueryBetween)
+	w.WriteString(table)
+	w.WriteString(field)
+	w.WriteBytes(minData)
+	w.WriteBytes(maxData)
+	w.WriteBool(inclusiveMin)
+	w.WriteBool(inclusiveMax)
+
+	c.conn.Write(w.Bytes())
+
+	r := NewReader(c.conn)
+	resp, err := ReadResp(r)
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("%s", resp.Error)
+	}
+
+	reader := NewReader(bytes.NewReader(resp.Data))
+	count, _ := reader.ReadUint64()
+	ids := make([]uint32, count)
+	for i := uint64(0); i < count; i++ {
+		id, _ := reader.ReadUint64()
+		ids[i] = uint32(id)
+	}
+	return ids, nil
+}
+
 func (c *Client) Count(table string) (uint32, error) {
 	w := NewWriter(nil)
 	w.WriteByte(OpCount)
