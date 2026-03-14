@@ -135,6 +135,10 @@ func main() {
         return
     }
     fmt.Println("Total records:", count)
+
+    // Note: Query operations (Query, QueryGT, QueryLT, QueryBetween) require
+    // indexes on the server side and are currently placeholders.
+    // Use Filter for server-side scanning of records.
     
     if err := client.Delete("users", id); err != nil {
         fmt.Println("Delete error:", err)
