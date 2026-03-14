@@ -70,7 +70,6 @@ func (c *Client) RegisterTable(name string, schema interface{}) error {
 	w := NewWriter(nil)
 	w.WriteByte(OpRegister)
 	w.WriteString(name)
-	w.WriteString(fmt.Sprintf("%T", schema))
 
 	c.conn.Write(w.Bytes())
 
@@ -89,7 +88,6 @@ func (c *Client) CreateTable(name string, schema interface{}) error {
 	w := NewWriter(nil)
 	w.WriteByte(OpCreateTable)
 	w.WriteString(name)
-	w.WriteString(fmt.Sprintf("%T", schema))
 
 	c.conn.Write(w.Bytes())
 
@@ -129,9 +127,18 @@ func (c *Client) ListTables() ([]string, error) {
 }
 
 func (c *Client) Insert(table string, record interface{}) (uint32, error) {
-	recordData, err := encodeRecord(record)
-	if err != nil {
-		return 0, err
+	var recordData []byte
+	switch r := record.(type) {
+	case []byte:
+		recordData = r
+	case string:
+		recordData = []byte(r)
+	default:
+		var err error
+		recordData, err = encodeRecord(record)
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	w := NewWriter(nil)
@@ -177,9 +184,18 @@ func (c *Client) Get(table string, id uint32) ([]byte, error) {
 }
 
 func (c *Client) Update(table string, id uint32, record interface{}) error {
-	recordData, err := encodeRecord(record)
-	if err != nil {
-		return err
+	var recordData []byte
+	switch r := record.(type) {
+	case []byte:
+		recordData = r
+	case string:
+		recordData = []byte(r)
+	default:
+		var err error
+		recordData, err = encodeRecord(record)
+		if err != nil {
+			return err
+		}
 	}
 
 	w := NewWriter(nil)
@@ -366,7 +382,11 @@ func (c *Client) Count(table string) (uint32, error) {
 	w.WriteByte(OpCount)
 	w.WriteString(table)
 
-	c.conn.Write(w.Bytes())
+	data := w.Bytes()
+	_, err := c.conn.Write(data)
+	if err != nil {
+		return 0, err
+	}
 
 	r := NewReader(c.conn)
 	resp, err := ReadResp(r)

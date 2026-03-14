@@ -14,17 +14,19 @@ A networked embedded database server written in Go, built on top of [embeddb](ht
 
 ## Architecture
 
-NetEmbedDB wraps embeddb to provide networked access to an embedded database. The client and server communicate using embeddb's native binary encoding format:
+NetEmbedDB wraps embeddb to provide networked access to an embedded database. Records are stored as raw JSON bytes in embeddb, enabling flexible schema-less storage.
 
-```
-[fieldKey:1][valueStartMarker:1][encodedValue...][valueEndMarker:1]
-```
+The client and server communicate using embeddb's native binary encoding format for primitives:
 
-Where:
-- `fieldKey`: Single byte identifying the field
-- `valueStartMarker`: 0x1E (record field value start)
-- `valueEndMarker`: 0x1F (record field value end)
-- Values encoded as: int→varint, uint→uvarint, float→float64bits→uvarint, string→length+data, bool→byte
+| Type | Encoding |
+|------|----------|
+| int, int8, int16, int32, int64 | Varint |
+| uint, uint8, uint16, uint32, uint64 | Uvarint |
+| float32, float64 | Float64bits → Uvarint |
+| string | Length (uvarint) + bytes |
+| bool | 1 byte (0 or 1) |
+
+**Data Storage**: Records are stored as JSON bytes (`RawRecord{Data []byte}`). This allows storing arbitrary data without requiring predefined struct schemas.
 
 ## Installation
 
@@ -75,20 +77,16 @@ if err := server.Listen("/tmp/netembeddb.sock"); err != nil {
 
 ### Connecting as a Client
 
+NetEmbedDB stores records as JSON bytes, so you can pass `[]byte` or `string` directly, or use any struct that can be JSON-marshaled.
+
 ```go
 package main
 
 import (
+    "encoding/json"
     "fmt"
     "netembeddb"
 )
-
-type User struct {
-    ID    uint32 `db:"id,primary"`
-    Name  string
-    Age   int    `db:"index"`
-    Email string
-}
 
 func main() {
     client, err := netembeddb.Connect("localhost:8080", "my-secret-key")
@@ -98,38 +96,48 @@ func main() {
     }
     defer client.Close()
     
-    if err := client.CreateTable("users", User{}); err != nil {
+    // Create table (schema parameter is ignored, using JSON storage)
+    if err := client.CreateTable("users", nil); err != nil {
         fmt.Println("Create table error:", err)
         return
     }
     
-    id, err := client.Insert("users", User{
-        Name:  "John Doe",
-        Age:   30,
-        Email: "john@example.com",
-    })
+    // Insert using JSON
+    user := map[string]any{
+        "name":  "John Doe",
+        "age":   30,
+        "email": "john@example.com",
+    }
+    userData, _ := json.Marshal(user)
+    
+    id, err := client.Insert("users", userData)
     if err != nil {
         fmt.Println("Insert error:", err)
         return
     }
     fmt.Println("Inserted record with ID:", id)
     
+    // Or use string directly
+    id2, _ := client.Insert("users", []byte(`{"name":"Jane","age":25}`))
+    fmt.Println("Inserted record 2 with ID:", id2)
+    
+    // Get record
     data, err := client.Get("users", id)
     if err != nil {
         fmt.Println("Get error:", err)
         return
     }
-    fmt.Println("Retrieved record data:", data)
+    fmt.Println("Retrieved record:", string(data))
     
-    if err := client.Update("users", id, User{
-        Name:  "Jane Doe",
-        Age:   31,
-        Email: "jane@example.com",
-    }); err != nil {
+    // Update record
+    user["age"] = 31
+    userData, _ = json.Marshal(user)
+    if err := client.Update("users", id, userData); err != nil {
         fmt.Println("Update error:", err)
         return
     }
     
+    // Count records
     count, err := client.Count("users")
     if err != nil {
         fmt.Println("Count error:", err)
@@ -137,36 +145,39 @@ func main() {
     }
     fmt.Println("Total records:", count)
     
-    // Query records by indexed field (requires db:index tag on struct)
-    // Users with Age > 25
-    ids, err := client.QueryGT("users", "Age", 25, false)
+    // Query by exact field match
+    ids, err := client.Query("users", "name", "John Doe")
+    if err != nil {
+        fmt.Println("Query error:", err)
+    } else {
+        fmt.Println("Users named John Doe:", ids)
+    }
+
+    // Query records greater than (age > 25)
+    ids, err = client.QueryGT("users", "age", 25, false)
     if err != nil {
         fmt.Println("QueryGT error:", err)
     } else {
-        fmt.Println("Users older than 25:", len(ids))
+        fmt.Println("Users older than 25:", ids)
     }
 
-    // Query records with less than
-    ids, err = client.QueryLT("users", "Age", 30, true) // inclusive
+    // Query records less than (age < 30)
+    ids, err = client.QueryLT("users", "age", 30, true) // inclusive
     if err != nil {
         fmt.Println("QueryLT error:", err)
     } else {
-        fmt.Println("Users age <= 30:", len(ids))
+        fmt.Println("Users age <= 30:", ids)
     }
 
     // Query records between values
-    ids, err = client.QueryBetween("users", "Age", 20, 40, true, true)
+    ids, err = client.QueryBetween("users", "age", 20, 40, true, true)
     if err != nil {
         fmt.Println("QueryBetween error:", err)
     } else {
-        fmt.Println("Users age 20-40:", len(ids))
+        fmt.Println("Users age 20-40:", ids)
     }
-
-
-    // Note: Query operations (Query, QueryGT, QueryLT, QueryBetween) require
-    // indexes on the server side and are currently placeholders.
-    // Use Filter for server-side scanning of records.
     
+    // Delete record
     if err := client.Delete("users", id); err != nil {
         fmt.Println("Delete error:", err)
         return
@@ -194,18 +205,6 @@ func main() {
 | `OpCount` | 0x0C | Count records in a table |
 | `OpClose` | 0x0F | Close connection |
 | `OpVacuum` | 0x10 | Vacuum the database |
-
-## Data Types
-
-The protocol supports the following data types using embeddb's encoding:
-
-| Type | Encoding |
-|------|----------|
-| int, int8, int16, int32, int64 | Varint |
-| uint, uint8, uint16, uint32, uint64 | Uvarint |
-| float32, float64 | Float64bits → Uvarint |
-| string | Length (uvarint) + bytes |
-| bool | 1 byte (0 or 1) |
 
 ## Project Structure
 

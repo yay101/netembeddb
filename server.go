@@ -1,12 +1,15 @@
 package netembeddb
 
 import (
+	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 
 	"github.com/yay101/embeddb"
@@ -19,19 +22,18 @@ type Server struct {
 	authKey string
 	ln      net.Listener
 	wg      sync.WaitGroup
-	tables  map[string]*embeddb.Table[GenericRecord]
+	tables  map[string]*embeddb.Table[RawRecord]
 }
 
-type GenericRecord struct {
-	ID   uint32 `db:"id,primary"`
-	Data map[string]interface{}
+type RawRecord struct {
+	Data []byte
 }
 
 func NewServer(dataDir string, authKey string) *Server {
 	return &Server{
 		dataDir: dataDir,
 		authKey: authKey,
-		tables:  make(map[string]*embeddb.Table[GenericRecord]),
+		tables:  make(map[string]*embeddb.Table[RawRecord]),
 	}
 }
 
@@ -96,7 +98,7 @@ func (s *Server) Close() error {
 	return nil
 }
 
-func (s *Server) getTable(table string) (*embeddb.Table[GenericRecord], error) {
+func (s *Server) getTable(table string) (*embeddb.Table[RawRecord], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -104,39 +106,7 @@ func (s *Server) getTable(table string) (*embeddb.Table[GenericRecord], error) {
 		return tbl, nil
 	}
 
-	tbl, err := embeddb.Use[GenericRecord](s.db, table)
-	if err != nil {
-		return nil, err
-	}
-
-	s.tables[table] = tbl
-	return tbl, nil
-}
-
-func (s *Server) ensureTable(table string) (*embeddb.Table[GenericRecord], error) {
-	// First check without lock
-	if tbl, ok := s.tables[table]; ok {
-		return tbl, nil
-	}
-
-	// Need to get the table
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Double check after acquiring lock
-	if tbl, ok := s.tables[table]; ok {
-		return tbl, nil
-	}
-
-	return s.getTableLocked(table)
-}
-
-func (s *Server) getTableLocked(table string) (*embeddb.Table[GenericRecord], error) {
-	if tbl, ok := s.tables[table]; ok {
-		return tbl, nil
-	}
-
-	tbl, err := embeddb.Use[GenericRecord](s.db, table)
+	tbl, err := embeddb.Use[RawRecord](s.db, table)
 	if err != nil {
 		return nil, err
 	}
@@ -155,9 +125,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	writeAuthResponse(conn, nil)
 
-	for {
-		r := NewReader(conn)
+	r := NewReader(conn)
 
+	for {
 		op, err := r.ReadByte()
 		if err != nil {
 			return
@@ -264,13 +234,6 @@ func (s *Server) handleInsert(r *Reader, conn net.Conn) {
 
 	w := NewWriter(nil)
 
-	record, err := decodeToMap(recordData)
-	if err != nil {
-		WriteError(w, fmt.Errorf("failed to decode record: %w", err))
-		conn.Write(w.Bytes())
-		return
-	}
-
 	tableRef, err := s.getTable(table)
 	if err != nil {
 		WriteError(w, fmt.Errorf("table not found: %w", err))
@@ -278,8 +241,8 @@ func (s *Server) handleInsert(r *Reader, conn net.Conn) {
 		return
 	}
 
-	genericRec := &GenericRecord{Data: record}
-	id, err := tableRef.Insert(genericRec)
+	rawRec := &RawRecord{Data: recordData}
+	id, err := tableRef.Insert(rawRec)
 	if err != nil {
 		WriteError(w, fmt.Errorf("failed to insert: %w", err))
 		conn.Write(w.Bytes())
@@ -310,8 +273,7 @@ func (s *Server) handleGet(r *Reader, conn net.Conn) {
 	if err != nil {
 		WriteResp(w, Response{Success: true, Data: []byte{}})
 	} else {
-		recordData := encodeFromMap(record.Data)
-		WriteResp(w, Response{Success: true, Data: recordData})
+		WriteResp(w, Response{Success: true, Data: record.Data})
 	}
 	conn.Write(w.Bytes())
 }
@@ -323,13 +285,6 @@ func (s *Server) handleUpdate(r *Reader, conn net.Conn) {
 
 	w := NewWriter(nil)
 
-	record, err := decodeToMap(recordData)
-	if err != nil {
-		WriteError(w, fmt.Errorf("failed to decode record: %w", err))
-		conn.Write(w.Bytes())
-		return
-	}
-
 	tableRef, err := s.getTable(table)
 	if err != nil {
 		WriteError(w, fmt.Errorf("table not found: %w", err))
@@ -337,8 +292,8 @@ func (s *Server) handleUpdate(r *Reader, conn net.Conn) {
 		return
 	}
 
-	genericRec := &GenericRecord{ID: uint32(id), Data: record}
-	err = tableRef.Update(uint32(id), genericRec)
+	rawRec := &RawRecord{Data: recordData}
+	err = tableRef.Update(uint32(id), rawRec)
 	if err != nil {
 		WriteError(w, fmt.Errorf("failed to update: %w", err))
 		conn.Write(w.Bytes())
@@ -374,54 +329,11 @@ func (s *Server) handleDelete(r *Reader, conn net.Conn) {
 }
 
 func (s *Server) handleQuery(r *Reader, conn net.Conn) {
-	s.handleQueryCommon(r, conn, func(table *embeddb.Table[GenericRecord], field string, value interface{}) ([]GenericRecord, error) {
-		return table.Query(field, value)
-	})
-}
-
-func (s *Server) handleQueryGT(r *Reader, conn net.Conn) {
-	inclusive, _ := r.ReadBool()
-	s.handleQueryCommon(r, conn, func(table *embeddb.Table[GenericRecord], field string, value interface{}) ([]GenericRecord, error) {
-		return table.QueryRangeGreaterThan(field, value, inclusive)
-	})
-}
-
-func (s *Server) handleQueryLT(r *Reader, conn net.Conn) {
-	inclusive, _ := r.ReadBool()
-	s.handleQueryCommon(r, conn, func(table *embeddb.Table[GenericRecord], field string, value interface{}) ([]GenericRecord, error) {
-		return table.QueryRangeLessThan(field, value, inclusive)
-	})
-}
-
-func (s *Server) handleQueryBetween(r *Reader, conn net.Conn) {
-	minData, _ := r.ReadBytes()
-	maxData, _ := r.ReadBytes()
-	inclusiveMin, _ := r.ReadBool()
-	inclusiveMax, _ := r.ReadBool()
-
-	min, _ := decodeValue(minData)
-	max, _ := decodeValue(maxData)
-
-	s.handleQueryCommon(r, conn, func(table *embeddb.Table[GenericRecord], field string, value interface{}) ([]GenericRecord, error) {
-		return table.QueryRangeBetween(field, min, max, inclusiveMin, inclusiveMax)
-	})
-}
-
-type queryFunc func(*embeddb.Table[GenericRecord], string, interface{}) ([]GenericRecord, error)
-
-func (s *Server) handleQueryCommon(r *Reader, conn net.Conn, queryFn queryFunc) {
 	table, _ := r.ReadString()
 	field, _ := r.ReadString()
 	valueData, _ := r.ReadBytes()
 
 	w := NewWriter(nil)
-
-	value, err := decodeValue(valueData)
-	if err != nil {
-		WriteError(w, fmt.Errorf("failed to decode value: %w", err))
-		conn.Write(w.Bytes())
-		return
-	}
 
 	tableRef, err := s.getTable(table)
 	if err != nil {
@@ -430,19 +342,106 @@ func (s *Server) handleQueryCommon(r *Reader, conn net.Conn, queryFn queryFunc) 
 		return
 	}
 
-	results, err := queryFn(tableRef, field, value)
+	ids := s.queryRecords(tableRef, field, valueData, func(recVal, queryVal any) bool {
+		return reflect.DeepEqual(recVal, queryVal)
+	})
+
+	data := new(bytes.Buffer)
+	data.Write(embeddb.EncodeUvarint(nil, uint64(len(ids))))
+	for _, id := range ids {
+		data.Write(embeddb.EncodeUvarint(nil, uint64(id)))
+	}
+	WriteResp(w, Response{Success: true, Data: data.Bytes()})
+	conn.Write(w.Bytes())
+}
+
+func (s *Server) handleQueryGT(r *Reader, conn net.Conn) {
+	table, _ := r.ReadString()
+	field, _ := r.ReadString()
+	valueData, _ := r.ReadBytes()
+	inclusive, _ := r.ReadBool()
+
+	w := NewWriter(nil)
+
+	tableRef, err := s.getTable(table)
 	if err != nil {
-		WriteError(w, fmt.Errorf("query failed: %w", err))
+		WriteError(w, fmt.Errorf("table not found: %w", err))
 		conn.Write(w.Bytes())
 		return
 	}
 
-	w.WriteUint64(uint64(len(results)))
-	for _, rec := range results {
-		w.WriteUint64(uint64(rec.ID))
+	ids := s.queryRecords(tableRef, field, valueData, func(recVal, queryVal any) bool {
+		if inclusive {
+			return compareGE(recVal, queryVal)
+		}
+		return compareGT(recVal, queryVal)
+	})
+
+	data := new(bytes.Buffer)
+	data.Write(embeddb.EncodeUvarint(nil, uint64(len(ids))))
+	for _, id := range ids {
+		data.Write(embeddb.EncodeUvarint(nil, uint64(id)))
+	}
+	WriteResp(w, Response{Success: true, Data: data.Bytes()})
+	conn.Write(w.Bytes())
+}
+
+func (s *Server) handleQueryLT(r *Reader, conn net.Conn) {
+	table, _ := r.ReadString()
+	field, _ := r.ReadString()
+	valueData, _ := r.ReadBytes()
+	inclusive, _ := r.ReadBool()
+
+	w := NewWriter(nil)
+
+	tableRef, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table not found: %w", err))
+		conn.Write(w.Bytes())
+		return
 	}
 
-	WriteResp(w, Response{Success: true, Data: w.Bytes()})
+	ids := s.queryRecords(tableRef, field, valueData, func(recVal, queryVal any) bool {
+		if inclusive {
+			return compareLE(recVal, queryVal)
+		}
+		return compareLT(recVal, queryVal)
+	})
+
+	data := new(bytes.Buffer)
+	data.Write(embeddb.EncodeUvarint(nil, uint64(len(ids))))
+	for _, id := range ids {
+		data.Write(embeddb.EncodeUvarint(nil, uint64(id)))
+	}
+	WriteResp(w, Response{Success: true, Data: data.Bytes()})
+	conn.Write(w.Bytes())
+}
+
+func (s *Server) handleQueryBetween(r *Reader, conn net.Conn) {
+	table, _ := r.ReadString()
+	field, _ := r.ReadString()
+	minData, _ := r.ReadBytes()
+	maxData, _ := r.ReadBytes()
+	inclusiveMin, _ := r.ReadBool()
+	inclusiveMax, _ := r.ReadBool()
+
+	w := NewWriter(nil)
+
+	tableRef, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table not found: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	ids := s.queryRecordsBetween(tableRef, field, minData, maxData, inclusiveMin, inclusiveMax)
+
+	data := new(bytes.Buffer)
+	data.Write(embeddb.EncodeUvarint(nil, uint64(len(ids))))
+	for _, id := range ids {
+		data.Write(embeddb.EncodeUvarint(nil, uint64(id)))
+	}
+	WriteResp(w, Response{Success: true, Data: data.Bytes()})
 	conn.Write(w.Bytes())
 }
 
@@ -458,7 +457,7 @@ func (s *Server) handleFilter(r *Reader, conn net.Conn) {
 		return
 	}
 
-	results, err := tableRef.Filter(func(r GenericRecord) bool { return true })
+	results, err := tableRef.Filter(func(r RawRecord) bool { return true })
 	if err != nil {
 		WriteError(w, fmt.Errorf("filter failed: %w", err))
 		conn.Write(w.Bytes())
@@ -467,7 +466,7 @@ func (s *Server) handleFilter(r *Reader, conn net.Conn) {
 
 	w.WriteUint64(uint64(len(results)))
 	for _, rec := range results {
-		w.WriteUint64(uint64(rec.ID))
+		w.WriteBytes(rec.Data)
 	}
 
 	WriteResp(w, Response{Success: true, Data: w.Bytes()})
@@ -487,13 +486,20 @@ func (s *Server) handleScan(r *Reader, conn net.Conn) {
 	}
 
 	count := tableRef.Count()
-	w.WriteUint64(uint64(count))
-	WriteResp(w, Response{Success: true, Data: w.Bytes()})
+	data := make([]byte, 4)
+	binary.BigEndian.PutUint32(data, uint32(count))
+	WriteResp(w, Response{Success: true, Data: data})
 	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleCount(r *Reader, conn net.Conn) {
-	table, _ := r.ReadString()
+	table, err := r.ReadString()
+	if err != nil {
+		w := NewWriter(nil)
+		WriteError(w, fmt.Errorf("failed to read table name: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
 
 	w := NewWriter(nil)
 
@@ -530,65 +536,6 @@ func (s *Server) handleVacuum(r *Reader, conn net.Conn) {
 	conn.Write(w.Bytes())
 }
 
-func decodeToMap(data []byte) (map[string]interface{}, error) {
-	result := make(map[string]interface{})
-	reader := &simpleReader{data: data, pos: 0}
-	r := NewReader(reader)
-
-	for {
-		name, err := r.ReadString()
-		if err != nil {
-			break
-		}
-
-		marker, err := r.ReadByte()
-		if err != nil {
-			break
-		}
-
-		if marker == embeddb.ValueStartMarker {
-			val, err := r.ReadString()
-			if err != nil {
-				break
-			}
-			result[name] = val
-		}
-
-		r.ReadByte()
-	}
-
-	return result, nil
-}
-
-func encodeFromMap(m map[string]interface{}) []byte {
-	var buffer []byte
-	idx := byte(0)
-	for _, v := range m {
-		buffer = append(buffer, idx, embeddb.ValueStartMarker)
-		switch val := v.(type) {
-		case string:
-			buffer = embeddb.EncodeString(buffer, val)
-		case int:
-			buffer = embeddb.EncodeVarint(buffer, int64(val))
-		case int64:
-			buffer = embeddb.EncodeVarint(buffer, val)
-		case uint:
-			buffer = embeddb.EncodeUvarint(buffer, uint64(val))
-		case uint32:
-			buffer = embeddb.EncodeUvarint(buffer, uint64(val))
-		case float64:
-			buffer = embeddb.EncodeFloat64(buffer, val)
-		case bool:
-			buffer = embeddb.EncodeBool(buffer, val)
-		default:
-			buffer = embeddb.EncodeString(buffer, fmt.Sprintf("%v", val))
-		}
-		buffer = append(buffer, embeddb.ValueEndMarker)
-		idx++
-	}
-	return buffer
-}
-
 type simpleReader struct {
 	data []byte
 	pos  int
@@ -601,35 +548,6 @@ func (r *simpleReader) Read(p []byte) (n int, err error) {
 	n = copy(p, r.data[r.pos:])
 	r.pos += n
 	return n, nil
-}
-
-func decodeValue(data []byte) (interface{}, error) {
-	if len(data) < 2 {
-		return nil, nil
-	}
-
-	reader := &simpleReader{data: data, pos: 0}
-	r := NewReader(reader)
-
-	marker, err := r.ReadByte()
-	if err != nil {
-		return nil, nil
-	}
-
-	if marker == embeddb.ValueStartMarker {
-		val, err := r.ReadString()
-		if err != nil {
-			return nil, nil
-		}
-		return val, nil
-	}
-
-	reader.pos = 0
-	val, err := r.ReadString()
-	if err != nil {
-		return nil, nil
-	}
-	return val, nil
 }
 
 func (s *Server) TablePath(name string) string {
@@ -648,4 +566,242 @@ func (s *Server) GetTable(name string) (any, bool) {
 
 func (s *Server) ListTables() []string {
 	return []string{}
+}
+
+func (s *Server) queryRecords(table *embeddb.Table[RawRecord], field string, valueData []byte, match func(any, any) bool) []uint32 {
+	var ids []uint32
+
+	count := uint32(table.Count())
+	for id := uint32(1); id <= count; id++ {
+		rec, err := table.Get(id)
+		if err != nil || rec == nil {
+			continue
+		}
+
+		var data map[string]any
+		if err := json.Unmarshal(rec.Data, &data); err != nil {
+			continue
+		}
+
+		recVal, ok := data[field]
+		if !ok {
+			continue
+		}
+
+		queryVal, err := decodeValue(valueData)
+		if err != nil {
+			continue
+		}
+
+		if match(recVal, queryVal) {
+			ids = append(ids, id)
+		}
+	}
+
+	return ids
+}
+
+func (s *Server) queryRecordsBetween(table *embeddb.Table[RawRecord], field string, minData, maxData []byte, inclusiveMin, inclusiveMax bool) []uint32 {
+	var ids []uint32
+
+	minVal, err := decodeValue(minData)
+	if err != nil {
+		return ids
+	}
+	maxVal, err := decodeValue(maxData)
+	if err != nil {
+		return ids
+	}
+
+	minCompare := compareGT
+	if inclusiveMin {
+		minCompare = compareGE
+	}
+	maxCompare := compareLT
+	if inclusiveMax {
+		maxCompare = compareLE
+	}
+
+	count := uint32(table.Count())
+	for id := uint32(1); id <= count; id++ {
+		rec, err := table.Get(id)
+		if err != nil || rec == nil {
+			continue
+		}
+
+		var data map[string]any
+		if err := json.Unmarshal(rec.Data, &data); err != nil {
+			continue
+		}
+
+		recVal, ok := data[field]
+		if !ok {
+			continue
+		}
+
+		if minCompare(recVal, minVal) && maxCompare(recVal, maxVal) {
+			ids = append(ids, id)
+		}
+	}
+
+	return ids
+}
+
+func decodeValue(data []byte) (any, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	firstByte := data[0]
+
+	switch {
+	case firstByte == 0x00:
+		return false, nil
+	case firstByte == 0x01:
+		return true, nil
+	case len(data) >= 2 && firstByte&0x80 != 0:
+		val, _, err := embeddb.DecodeVarint(data)
+		return val, err
+	case len(data) == 1 && firstByte%2 == 0:
+		val, _, err := embeddb.DecodeVarint(data)
+		return val, err
+	default:
+		length, n := binary.Uvarint(data)
+		if n > 0 && len(data) >= int(n)+int(length) {
+			str, _, err := embeddb.DecodeString(data)
+			return str, err
+		}
+		val, _, err := embeddb.DecodeUvarint(data)
+		return val, err
+	}
+}
+
+func compareGT(a, b any) bool {
+	aNum, aOk := toFloat64(a)
+	bNum, bOk := toFloat64(b)
+	if aOk && bOk {
+		return aNum > bNum
+	}
+	aInt, aOk := toInt64(a)
+	bInt, bOk := toInt64(b)
+	if aOk && bOk {
+		return aInt > bInt
+	}
+	aStr, aOk := a.(string)
+	bStr, bOk := b.(string)
+	if aOk && bOk {
+		return aStr > bStr
+	}
+	return false
+}
+
+func compareGE(a, b any) bool {
+	aNum, aOk := toFloat64(a)
+	bNum, bOk := toFloat64(b)
+	if aOk && bOk {
+		return aNum >= bNum
+	}
+	aInt, aOk := toInt64(a)
+	bInt, bOk := toInt64(b)
+	if aOk && bOk {
+		return aInt >= bInt
+	}
+	aStr, aOk := a.(string)
+	bStr, bOk := b.(string)
+	if aOk && bOk {
+		return aStr >= bStr
+	}
+	return false
+}
+
+func compareLT(a, b any) bool {
+	aNum, aOk := toFloat64(a)
+	bNum, bOk := toFloat64(b)
+	if aOk && bOk {
+		return aNum < bNum
+	}
+	aInt, aOk := toInt64(a)
+	bInt, bOk := toInt64(b)
+	if aOk && bOk {
+		return aInt < bInt
+	}
+	aStr, aOk := a.(string)
+	bStr, bOk := b.(string)
+	if aOk && bOk {
+		return aStr < bStr
+	}
+	return false
+}
+
+func compareLE(a, b any) bool {
+	aNum, aOk := toFloat64(a)
+	bNum, bOk := toFloat64(b)
+	if aOk && bOk {
+		return aNum <= bNum
+	}
+	aInt, aOk := toInt64(a)
+	bInt, bOk := toInt64(b)
+	if aOk && bOk {
+		return aInt <= bInt
+	}
+	aStr, aOk := a.(string)
+	bStr, bOk := b.(string)
+	if aOk && bOk {
+		return aStr <= bStr
+	}
+	return false
+}
+
+func toFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	default:
+		return 0, false
+	}
+}
+
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case int8:
+		return int64(n), true
+	case uint64:
+		return int64(n), true
+	case uint:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	case uint16:
+		return int64(n), true
+	case uint8:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	case float32:
+		return int64(n), true
+	default:
+		return 0, false
+	}
 }
