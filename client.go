@@ -7,6 +7,8 @@ import (
 	"net"
 	"reflect"
 	"time"
+
+	"github.com/yay101/embeddb"
 )
 
 type Client struct {
@@ -26,11 +28,9 @@ func Connect(addr string, authKey string) (*Client, error) {
 		}
 	}
 
-	// Send auth key
 	if authKey != "" {
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 
-		// Write key length as varint
 		var buf [10]byte
 		n := binary.PutUvarint(buf[:], uint64(len(authKey)))
 		conn.Write(buf[:n])
@@ -39,7 +39,6 @@ func Connect(addr string, authKey string) (*Client, error) {
 		conn.SetWriteDeadline(time.Time{})
 	}
 
-	// Read auth response
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	resp := make([]byte, 1)
 	_, err = conn.Read(resp)
@@ -73,15 +72,15 @@ func (c *Client) RegisterTable(name string, schema interface{}) error {
 	w.WriteString(name)
 	w.WriteString(fmt.Sprintf("%T", schema))
 
-	w.WriteTo(c.conn)
+	c.conn.Write(w.Bytes())
 
 	r := NewReader(c.conn)
-	resp, err := ReadResponse(r)
+	resp, err := ReadResp(r)
 	if err != nil {
 		return err
 	}
 	if !resp.Success {
-		return fmt.Errorf(resp.Error)
+		return fmt.Errorf("%s", resp.Error)
 	}
 	return nil
 }
@@ -92,15 +91,15 @@ func (c *Client) CreateTable(name string, schema interface{}) error {
 	w.WriteString(name)
 	w.WriteString(fmt.Sprintf("%T", schema))
 
-	w.WriteTo(c.conn)
+	c.conn.Write(w.Bytes())
 
 	r := NewReader(c.conn)
-	resp, err := ReadResponse(r)
+	resp, err := ReadResp(r)
 	if err != nil {
 		return err
 	}
 	if !resp.Success {
-		return fmt.Errorf(resp.Error)
+		return fmt.Errorf("%s", resp.Error)
 	}
 	return nil
 }
@@ -109,15 +108,15 @@ func (c *Client) ListTables() ([]string, error) {
 	w := NewWriter(nil)
 	w.WriteByte(OpListTables)
 
-	w.WriteTo(c.conn)
+	c.conn.Write(w.Bytes())
 
 	r := NewReader(c.conn)
-	resp, err := ReadResponse(r)
+	resp, err := ReadResp(r)
 	if err != nil {
 		return nil, err
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf(resp.Error)
+		return nil, fmt.Errorf("%s", resp.Error)
 	}
 
 	reader := NewReader(bytes.NewReader(resp.Data))
@@ -140,15 +139,15 @@ func (c *Client) Insert(table string, record interface{}) (uint32, error) {
 	w.WriteString(table)
 	w.WriteBytes(recordData)
 
-	w.WriteTo(c.conn)
+	c.conn.Write(w.Bytes())
 
 	r := NewReader(c.conn)
-	resp, err := ReadResponse(r)
+	resp, err := ReadResp(r)
 	if err != nil {
 		return 0, err
 	}
 	if !resp.Success {
-		return 0, fmt.Errorf(resp.Error)
+		return 0, fmt.Errorf("%s", resp.Error)
 	}
 
 	if len(resp.Data) >= 4 {
@@ -163,15 +162,15 @@ func (c *Client) Get(table string, id uint32) ([]byte, error) {
 	w.WriteString(table)
 	w.WriteUint64(uint64(id))
 
-	w.WriteTo(c.conn)
+	c.conn.Write(w.Bytes())
 
 	r := NewReader(c.conn)
-	resp, err := ReadResponse(r)
+	resp, err := ReadResp(r)
 	if err != nil {
 		return nil, err
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf(resp.Error)
+		return nil, fmt.Errorf("%s", resp.Error)
 	}
 
 	return resp.Data, nil
@@ -189,15 +188,15 @@ func (c *Client) Update(table string, id uint32, record interface{}) error {
 	w.WriteUint64(uint64(id))
 	w.WriteBytes(recordData)
 
-	w.WriteTo(c.conn)
+	c.conn.Write(w.Bytes())
 
 	r := NewReader(c.conn)
-	resp, err := ReadResponse(r)
+	resp, err := ReadResp(r)
 	if err != nil {
 		return err
 	}
 	if !resp.Success {
-		return fmt.Errorf(resp.Error)
+		return fmt.Errorf("%s", resp.Error)
 	}
 	return nil
 }
@@ -208,21 +207,21 @@ func (c *Client) Delete(table string, id uint32) error {
 	w.WriteString(table)
 	w.WriteUint64(uint64(id))
 
-	w.WriteTo(c.conn)
+	c.conn.Write(w.Bytes())
 
 	r := NewReader(c.conn)
-	resp, err := ReadResponse(r)
+	resp, err := ReadResp(r)
 	if err != nil {
 		return err
 	}
 	if !resp.Success {
-		return fmt.Errorf(resp.Error)
+		return fmt.Errorf("%s", resp.Error)
 	}
 	return nil
 }
 
 func (c *Client) Query(table, field string, value interface{}) ([]uint32, error) {
-	valueData, err := EncodeValue(value)
+	valueData, err := encodeValue(value)
 	if err != nil {
 		return nil, err
 	}
@@ -233,15 +232,15 @@ func (c *Client) Query(table, field string, value interface{}) ([]uint32, error)
 	w.WriteString(field)
 	w.WriteBytes(valueData)
 
-	w.WriteTo(c.conn)
+	c.conn.Write(w.Bytes())
 
 	r := NewReader(c.conn)
-	resp, err := ReadResponse(r)
+	resp, err := ReadResp(r)
 	if err != nil {
 		return nil, err
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf(resp.Error)
+		return nil, fmt.Errorf("%s", resp.Error)
 	}
 
 	reader := NewReader(bytes.NewReader(resp.Data))
@@ -259,15 +258,15 @@ func (c *Client) Count(table string) (uint32, error) {
 	w.WriteByte(OpCount)
 	w.WriteString(table)
 
-	w.WriteTo(c.conn)
+	c.conn.Write(w.Bytes())
 
 	r := NewReader(c.conn)
-	resp, err := ReadResponse(r)
+	resp, err := ReadResp(r)
 	if err != nil {
 		return 0, err
 	}
 	if !resp.Success {
-		return 0, fmt.Errorf(resp.Error)
+		return 0, fmt.Errorf("%s", resp.Error)
 	}
 
 	if len(resp.Data) >= 4 {
@@ -276,42 +275,111 @@ func (c *Client) Count(table string) (uint32, error) {
 	return 0, nil
 }
 
-func encodeRecord(record interface{}) ([]byte, error) {
+func (c *Client) Vacuum() error {
 	w := NewWriter(nil)
+	w.WriteByte(OpVacuum)
 
-	val := reflect.ValueOf(record)
-	if val.Kind() == reflect.Ptr {
-		val = val.Elem()
+	c.conn.Write(w.Bytes())
+
+	r := NewReader(c.conn)
+	resp, err := ReadResp(r)
+	if err != nil {
+		return err
 	}
-	typ := val.Type()
+	if !resp.Success {
+		return fmt.Errorf("%s", resp.Error)
+	}
+	return nil
+}
 
-	for i := 0; i < typ.NumField(); i++ {
-		field := typ.Field(i)
-		if !field.IsExported() {
+func encodeRecord(record interface{}) ([]byte, error) {
+	var buffer []byte
+
+	layout, err := embeddb.ComputeStructLayout(record)
+	if err != nil {
+		return nil, err
+	}
+
+	keys := make([]byte, 0, len(layout.FieldOffsets))
+	for key := range layout.FieldOffsets {
+		keys = append(keys, key)
+	}
+
+	for _, key := range keys {
+		fieldOffset := layout.FieldOffsets[key]
+		if fieldOffset.IsStruct && !fieldOffset.IsTime {
+			continue
+		}
+		if fieldOffset.Primary {
 			continue
 		}
 
-		w.WriteString(field.Name)
-		w.WriteByte(0x01) // Start marker
+		buffer = append(buffer, key, embeddb.ValueStartMarker)
 
-		fieldVal := val.Field(i)
-		switch fieldVal.Kind() {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			w.WriteInt64(fieldVal.Int())
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			w.WriteUint64(fieldVal.Uint())
-		case reflect.Float32:
-			w.WriteFloat32(float32(fieldVal.Float()))
-		case reflect.Float64:
-			w.WriteFloat64(fieldVal.Float())
-		case reflect.String:
-			w.WriteString(fieldVal.String())
-		case reflect.Bool:
-			w.WriteBool(fieldVal.Bool())
+		val := reflect.ValueOf(record)
+		if val.Kind() == reflect.Ptr {
+			val = val.Elem()
 		}
 
-		w.WriteByte(0x04) // End marker
+		fieldVal := val.FieldByName(fieldOffset.Name)
+		if !fieldVal.IsValid() {
+			continue
+		}
+
+		switch fieldVal.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			buffer = embeddb.EncodeVarint(buffer, fieldVal.Int())
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			buffer = embeddb.EncodeUvarint(buffer, fieldVal.Uint())
+		case reflect.Float32, reflect.Float64:
+			buffer = embeddb.EncodeFloat64(buffer, fieldVal.Float())
+		case reflect.String:
+			buffer = embeddb.EncodeString(buffer, fieldVal.String())
+		case reflect.Bool:
+			buffer = embeddb.EncodeBool(buffer, fieldVal.Bool())
+		}
+
+		buffer = append(buffer, embeddb.ValueEndMarker)
 	}
 
-	return w.Bytes(), nil
+	return buffer, nil
+}
+
+func encodeValue(value interface{}) ([]byte, error) {
+	var buffer []byte
+
+	switch v := value.(type) {
+	case int:
+		buffer = embeddb.EncodeVarint(buffer, int64(v))
+	case int8:
+		buffer = embeddb.EncodeVarint(buffer, int64(v))
+	case int16:
+		buffer = embeddb.EncodeVarint(buffer, int64(v))
+	case int32:
+		buffer = embeddb.EncodeVarint(buffer, int64(v))
+	case int64:
+		buffer = embeddb.EncodeVarint(buffer, v)
+	case uint:
+		buffer = embeddb.EncodeUvarint(buffer, uint64(v))
+	case uint8:
+		buffer = embeddb.EncodeUvarint(buffer, uint64(v))
+	case uint16:
+		buffer = embeddb.EncodeUvarint(buffer, uint64(v))
+	case uint32:
+		buffer = embeddb.EncodeUvarint(buffer, uint64(v))
+	case uint64:
+		buffer = embeddb.EncodeUvarint(buffer, v)
+	case float32:
+		buffer = embeddb.EncodeFloat64(buffer, float64(v))
+	case float64:
+		buffer = embeddb.EncodeFloat64(buffer, v)
+	case string:
+		buffer = embeddb.EncodeString(buffer, v)
+	case bool:
+		buffer = embeddb.EncodeBool(buffer, v)
+	default:
+		return nil, fmt.Errorf("unsupported value type: %T", value)
+	}
+
+	return buffer, nil
 }

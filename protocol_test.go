@@ -3,165 +3,123 @@ package netembeddb
 import (
 	"bytes"
 	"testing"
-	"time"
+
+	"github.com/yay101/embeddb"
 )
 
-func TestProtocolEncodeDecodeTime(t *testing.T) {
-	now := time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)
-
-	encoded, err := EncodeValue(now)
-	if err != nil {
-		t.Fatalf("EncodeValue failed: %v", err)
+func TestEncodeVarint(t *testing.T) {
+	encoded := embeddb.EncodeVarint(nil, 42)
+	if len(encoded) == 0 {
+		t.Error("expected encoded bytes")
 	}
 
-	decoded, err := DecodeValue(encoded, "time.Time")
+	val, _, err := embeddb.DecodeVarint(encoded)
 	if err != nil {
-		t.Fatalf("DecodeValue failed: %v", err)
+		t.Fatalf("DecodeVarint failed: %v", err)
 	}
-
-	decodedTime := decoded.(time.Time)
-	if !decodedTime.Equal(now) {
-		t.Errorf("Time mismatch: got %v, want %v", decodedTime, now)
+	if val != 42 {
+		t.Errorf("got %d, want 42", val)
 	}
 }
 
-func TestProtocolEncodeDecodeSliceString(t *testing.T) {
-	slice := []string{"admin", "developer", "user"}
+func TestEncodeUvarint(t *testing.T) {
+	encoded := embeddb.EncodeUvarint(nil, 42)
+	if len(encoded) == 0 {
+		t.Error("expected encoded bytes")
+	}
 
-	encoded, err := EncodeValue(slice)
+	val, _, err := embeddb.DecodeUvarint(encoded)
 	if err != nil {
-		t.Fatalf("EncodeValue failed: %v", err)
+		t.Fatalf("DecodeUvarint failed: %v", err)
 	}
-
-	decoded, err := DecodeValue(encoded, "[]string")
-	if err != nil {
-		t.Fatalf("DecodeValue failed: %v", err)
-	}
-
-	decodedSlice, ok := decoded.([]string)
-	if !ok {
-		t.Fatalf("Expected []string, got %T", decoded)
-	}
-
-	if len(decodedSlice) != len(slice) {
-		t.Errorf("Length mismatch: got %d, want %d", len(decodedSlice), len(slice))
-	}
-
-	for i := range slice {
-		if decodedSlice[i] != slice[i] {
-			t.Errorf("Slice[%d] mismatch: got %s, want %s", i, decodedSlice[i], slice[i])
-		}
+	if val != 42 {
+		t.Errorf("got %d, want 42", val)
 	}
 }
 
-func TestProtocolEncodeDecodeSliceInt(t *testing.T) {
-	slice := []int{10, 20, 30, 40}
+func TestEncodeString(t *testing.T) {
+	encoded := embeddb.EncodeString(nil, "hello")
+	if len(encoded) == 0 {
+		t.Error("expected encoded bytes")
+	}
 
-	encoded, err := EncodeValue(slice)
+	val, _, err := embeddb.DecodeString(encoded)
 	if err != nil {
-		t.Fatalf("EncodeValue failed: %v", err)
+		t.Fatalf("DecodeString failed: %v", err)
 	}
-
-	decoded, err := DecodeValue(encoded, "[]int")
-	if err != nil {
-		t.Fatalf("DecodeValue failed: %v", err)
-	}
-
-	decodedSlice, ok := decoded.([]int)
-	if !ok {
-		t.Fatalf("Expected []int, got %T", decoded)
-	}
-
-	if len(decodedSlice) != len(slice) {
-		t.Errorf("Length mismatch: got %d, want %d", len(decodedSlice), len(slice))
-	}
-
-	for i := range slice {
-		if decodedSlice[i] != slice[i] {
-			t.Errorf("Slice[%d] mismatch: got %d, want %d", i, decodedSlice[i], slice[i])
-		}
+	if val != "hello" {
+		t.Errorf("got %s, want hello", val)
 	}
 }
 
-func TestProtocolEncodeDecodeInt(t *testing.T) {
-	encoded, err := EncodeValue(int64(42))
-	if err != nil {
-		t.Fatalf("EncodeValue failed: %v", err)
+func TestEncodeBool(t *testing.T) {
+	encoded := embeddb.EncodeBool(nil, true)
+	if len(encoded) == 0 {
+		t.Error("expected encoded bytes")
 	}
 
-	decoded, err := DecodeValue(encoded, "int64")
+	val, _, err := embeddb.DecodeBool(encoded)
 	if err != nil {
-		t.Fatalf("DecodeValue failed: %v", err)
+		t.Fatalf("DecodeBool failed: %v", err)
+	}
+	if val != true {
+		t.Errorf("got %v, want true", val)
 	}
 
-	if decoded != int64(42) {
-		t.Errorf("Int mismatch: got %v, want 42", decoded)
+	encoded = embeddb.EncodeBool(nil, false)
+	val, _, _ = embeddb.DecodeBool(encoded)
+	if val != false {
+		t.Errorf("got %v, want false", val)
 	}
 }
 
-func TestProtocolEncodeDecodeString(t *testing.T) {
-	encoded, err := EncodeValue("hello world")
-	if err != nil {
-		t.Fatalf("EncodeValue failed: %v", err)
+func TestEncodeFloat(t *testing.T) {
+	encoded := embeddb.EncodeFloat64(nil, 3.14159)
+	if len(encoded) == 0 {
+		t.Error("expected encoded bytes")
 	}
 
-	decoded, err := DecodeValue(encoded, "string")
+	val, _, err := embeddb.DecodeFloat64(encoded)
 	if err != nil {
-		t.Fatalf("DecodeValue failed: %v", err)
+		t.Fatalf("DecodeFloat64 failed: %v", err)
 	}
-
-	if decoded != "hello world" {
-		t.Errorf("String mismatch: got %v, want 'hello world'", decoded)
+	if val != 3.14159 {
+		t.Errorf("got %f, want 3.14159", val)
 	}
 }
 
-func TestProtocolEncodeDecodeBool(t *testing.T) {
-	encoded, err := EncodeValue(true)
-	if err != nil {
-		t.Fatalf("EncodeValue failed: %v", err)
-	}
-
-	decoded, err := DecodeValue(encoded, "bool")
-	if err != nil {
-		t.Fatalf("DecodeValue failed: %v", err)
-	}
-
-	if decoded != true {
-		t.Errorf("Bool mismatch: got %v, want true", decoded)
-	}
-}
-
-func TestProtocolWriteReadTime(t *testing.T) {
-	now := time.Date(2024, 6, 15, 14, 30, 0, 0, time.UTC)
-
+func TestWriterReader(t *testing.T) {
 	w := NewWriter(nil)
-	if err := w.WriteTime(now); err != nil {
-		t.Fatalf("WriteTime failed: %v", err)
-	}
+	w.WriteByte(0x01)
+	w.WriteString("test")
+	w.WriteUint64(123)
+	w.WriteInt64(-456)
+	w.WriteBool(true)
 
 	r := NewReader(bytes.NewReader(w.Bytes()))
-	decoded, err := r.ReadTime()
-	if err != nil {
-		t.Fatalf("ReadTime failed: %v", err)
+
+	b, err := r.ReadByte()
+	if err != nil || b != 0x01 {
+		t.Errorf("ReadByte failed: got %v", b)
 	}
 
-	if !decoded.Equal(now) {
-		t.Errorf("Time mismatch: got %v, want %v", decoded, now)
-	}
-}
-
-func TestProtocolEncodeDecodeFloat(t *testing.T) {
-	encoded, err := EncodeValue(float64(3.14159))
-	if err != nil {
-		t.Fatalf("EncodeValue failed: %v", err)
+	s, err := r.ReadString()
+	if err != nil || s != "test" {
+		t.Errorf("ReadString failed: got %v", s)
 	}
 
-	decoded, err := DecodeValue(encoded, "float64")
-	if err != nil {
-		t.Fatalf("DecodeValue failed: %v", err)
+	u, err := r.ReadUint64()
+	if err != nil || u != 123 {
+		t.Errorf("ReadUint64 failed: got %v", u)
 	}
 
-	if decoded != float64(3.14159) {
-		t.Errorf("Float mismatch: got %v, want 3.14159", decoded)
+	i, err := r.ReadInt64()
+	if err != nil || i != -456 {
+		t.Errorf("ReadInt64 failed: got %v", i)
+	}
+
+	bl, err := r.ReadBool()
+	if err != nil || bl != true {
+		t.Errorf("ReadBool failed: got %v", bl)
 	}
 }

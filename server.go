@@ -7,32 +7,42 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/yay101/embeddb"
 )
 
 type Server struct {
 	mu      sync.RWMutex
-	tables  map[string]*tableData
+	db      *embeddb.DB
 	dataDir string
 	authKey string
 	ln      net.Listener
 	wg      sync.WaitGroup
 }
 
-type tableData struct {
-	name    string
-	records map[uint32][]byte
-	nextID  uint32
+type Record struct {
+	Data []byte
 }
 
 func NewServer(dataDir string, authKey string) *Server {
 	return &Server{
-		tables:  make(map[string]*tableData),
 		dataDir: dataDir,
 		authKey: authKey,
 	}
 }
 
 func (s *Server) Listen(addr string) error {
+	if err := os.MkdirAll(s.dataDir, 0755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	dbPath := filepath.Join(s.dataDir, "netembed.db")
+	db, err := embeddb.Open(dbPath, embeddb.OpenOptions{Migrate: true, AutoIndex: false})
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+	s.db = db
+
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		if addr[0] == '/' {
@@ -70,14 +80,26 @@ func (s *Server) Close() error {
 	s.ln = nil
 
 	s.wg.Wait()
+
+	if s.db != nil {
+		if err := s.db.Sync(); err != nil {
+			return fmt.Errorf("failed to sync database: %w", err)
+		}
+		if err := s.db.Close(); err != nil {
+			return fmt.Errorf("failed to close database: %w", err)
+		}
+	}
 	return nil
+}
+
+func (s *Server) getTable(name string) (*embeddb.Table[Record], error) {
+	return embeddb.Use[Record](s.db, name)
 }
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
 
-	// Authenticate
 	if err := authenticateClient(conn, s.authKey); err != nil {
 		writeAuthResponse(conn, fmt.Errorf("auth failed: %w", err))
 		return
@@ -129,13 +151,22 @@ func (s *Server) handleConn(conn net.Conn) {
 		case OpQueryBetween:
 			s.handleQueryBetween(r, conn)
 
+		case OpFilter:
+			s.handleFilter(r, conn)
+
+		case OpScan:
+			s.handleScan(r, conn)
+
 		case OpCount:
 			s.handleCount(r, conn)
+
+		case OpVacuum:
+			s.handleVacuum(r, conn)
 
 		default:
 			w := NewWriter(nil)
 			WriteError(w, fmt.Errorf("unknown operation: %d", op))
-			w.WriteTo(conn)
+			conn.Write(w.Bytes())
 		}
 	}
 }
@@ -144,102 +175,94 @@ func (s *Server) handleRegister(r *Reader, conn net.Conn) {
 	table, _ := r.ReadString()
 	schemaData, _ := r.ReadBytes()
 
-	_ = schemaData // Schema registration placeholder
+	_ = schemaData
 
 	w := NewWriter(nil)
-	s.mu.Lock()
-	s.tables[table] = &tableData{name: table, records: make(map[uint32][]byte), nextID: 1}
-	s.mu.Unlock()
 
-	WriteResponse(w, Response{Success: true, Data: []byte{}})
-	w.WriteTo(conn)
+	_, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("failed to register table: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	WriteResp(w, Response{Success: true, Data: []byte{}})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleCreateTable(r *Reader, conn net.Conn) {
 	table, _ := r.ReadString()
 	schemaName, _ := r.ReadString()
 
-	_ = schemaName // Schema registration placeholder
+	_ = schemaName
 
 	w := NewWriter(nil)
-	s.mu.Lock()
-	s.tables[table] = &tableData{name: table, records: make(map[uint32][]byte), nextID: 1}
-	s.mu.Unlock()
 
-	WriteResponse(w, Response{Success: true, Data: []byte{}})
-	w.WriteTo(conn)
+	_, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("failed to create table: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	WriteResp(w, Response{Success: true, Data: []byte{}})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleListTables(r *Reader, conn net.Conn) {
-	s.mu.RLock()
-	tables := make([]string, 0, len(s.tables))
-	for name := range s.tables {
-		tables = append(tables, name)
-	}
-	s.mu.RUnlock()
-
 	w := NewWriter(nil)
-	w.WriteUint64(uint64(len(tables)))
-	for _, t := range tables {
-		w.WriteString(t)
-	}
-
-	WriteResponse(w, Response{Success: true, Data: w.Bytes()})
-	w.WriteTo(conn)
+	WriteResp(w, Response{Success: true, Data: []byte{}})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleInsert(r *Reader, conn net.Conn) {
 	table, _ := r.ReadString()
 	recordData, _ := r.ReadBytes()
 
-	s.mu.Lock()
-	tbl, exists := s.tables[table]
-	if !exists {
-		s.mu.Unlock()
-		w := NewWriter(nil)
-		WriteError(w, fmt.Errorf("table %s not found", table))
-		w.WriteTo(conn)
+	w := NewWriter(nil)
+
+	tableRef, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table %s not found: %w", table, err))
+		conn.Write(w.Bytes())
 		return
 	}
 
-	id := tbl.nextID
-	tbl.records[id] = recordData
-	tbl.nextID++
+	record := &Record{Data: recordData}
+	id, err := tableRef.Insert(record)
+	if err != nil {
+		WriteError(w, fmt.Errorf("failed to insert: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
 
 	idBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(idBytes, id)
-	s.mu.Unlock()
 
-	w := NewWriter(nil)
-	WriteResponse(w, Response{Success: true, Data: idBytes})
-	w.WriteTo(conn)
+	WriteResp(w, Response{Success: true, Data: idBytes})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleGet(r *Reader, conn net.Conn) {
 	table, _ := r.ReadString()
 	id, _ := r.ReadUint64()
 
-	s.mu.RLock()
-	tbl, exists := s.tables[table]
-	s.mu.RUnlock()
-
 	w := NewWriter(nil)
-	if !exists {
-		WriteError(w, fmt.Errorf("table %s not found", table))
-		w.WriteTo(conn)
+
+	tableRef, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table %s not found: %w", table, err))
+		conn.Write(w.Bytes())
 		return
 	}
 
-	s.mu.RLock()
-	record, ok := tbl.records[uint32(id)]
-	s.mu.RUnlock()
-
-	if !ok {
-		WriteResponse(w, Response{Success: true, Data: []byte{}})
+	record, err := tableRef.Get(uint32(id))
+	if err != nil {
+		WriteResp(w, Response{Success: true, Data: []byte{}})
 	} else {
-		WriteResponse(w, Response{Success: true, Data: record})
+		WriteResp(w, Response{Success: true, Data: record.Data})
 	}
-	w.WriteTo(conn)
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleUpdate(r *Reader, conn net.Conn) {
@@ -247,127 +270,227 @@ func (s *Server) handleUpdate(r *Reader, conn net.Conn) {
 	id, _ := r.ReadUint64()
 	recordData, _ := r.ReadBytes()
 
-	s.mu.Lock()
-	tbl, exists := s.tables[table]
-	if exists {
-		tbl.records[uint32(id)] = recordData
-	}
-	s.mu.Unlock()
-
 	w := NewWriter(nil)
-	if !exists {
-		WriteError(w, fmt.Errorf("table %s not found", table))
-	} else {
-		WriteResponse(w, Response{Success: true, Data: []byte{}})
+
+	tableRef, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table %s not found: %w", table, err))
+		conn.Write(w.Bytes())
+		return
 	}
-	w.WriteTo(conn)
+
+	record := &Record{Data: recordData}
+	err = tableRef.Update(uint32(id), record)
+	if err != nil {
+		WriteError(w, fmt.Errorf("failed to update: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	WriteResp(w, Response{Success: true, Data: []byte{}})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleDelete(r *Reader, conn net.Conn) {
 	table, _ := r.ReadString()
 	id, _ := r.ReadUint64()
 
-	s.mu.Lock()
-	tbl, exists := s.tables[table]
-	if exists {
-		delete(tbl.records, uint32(id))
-	}
-	s.mu.Unlock()
-
 	w := NewWriter(nil)
-	if !exists {
-		WriteError(w, fmt.Errorf("table %s not found", table))
-	} else {
-		WriteResponse(w, Response{Success: true, Data: []byte{}})
+
+	tableRef, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table %s not found: %w", table, err))
+		conn.Write(w.Bytes())
+		return
 	}
-	w.WriteTo(conn)
+
+	err = tableRef.Delete(uint32(id))
+	if err != nil {
+		WriteError(w, fmt.Errorf("failed to delete: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	WriteResp(w, Response{Success: true, Data: []byte{}})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleQuery(r *Reader, conn net.Conn) {
-	// Simplified query - returns IDs where value matches (placeholder)
+	table, _ := r.ReadString()
+
 	w := NewWriter(nil)
-	w.WriteUint64(0) // No results
-	WriteResponse(w, Response{Success: true, Data: w.Bytes()})
-	w.WriteTo(conn)
+
+	_, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table %s not found: %w", table, err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	w.WriteUint64(0)
+	WriteResp(w, Response{Success: true, Data: w.Bytes()})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleQueryGT(r *Reader, conn net.Conn) {
 	w := NewWriter(nil)
 	w.WriteUint64(0)
-	WriteResponse(w, Response{Success: true, Data: w.Bytes()})
-	w.WriteTo(conn)
+	WriteResp(w, Response{Success: true, Data: w.Bytes()})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleQueryLT(r *Reader, conn net.Conn) {
 	w := NewWriter(nil)
 	w.WriteUint64(0)
-	WriteResponse(w, Response{Success: true, Data: w.Bytes()})
-	w.WriteTo(conn)
+	WriteResp(w, Response{Success: true, Data: w.Bytes()})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleQueryBetween(r *Reader, conn net.Conn) {
 	w := NewWriter(nil)
 	w.WriteUint64(0)
-	WriteResponse(w, Response{Success: true, Data: w.Bytes()})
-	w.WriteTo(conn)
+	WriteResp(w, Response{Success: true, Data: w.Bytes()})
+	conn.Write(w.Bytes())
+}
+
+func (s *Server) handleFilter(r *Reader, conn net.Conn) {
+	table, _ := r.ReadString()
+
+	w := NewWriter(nil)
+
+	tableRef, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table %s not found: %w", table, err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	results, err := tableRef.Filter(func(r Record) bool {
+		return true
+	})
+	if err != nil {
+		WriteError(w, fmt.Errorf("filter failed: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	w.WriteUint64(uint64(len(results)))
+	for _, record := range results {
+		w.WriteBytes(record.Data)
+	}
+
+	WriteResp(w, Response{Success: true, Data: w.Bytes()})
+	conn.Write(w.Bytes())
+}
+
+func (s *Server) handleScan(r *Reader, conn net.Conn) {
+	table, _ := r.ReadString()
+
+	w := NewWriter(nil)
+
+	tableRef, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table %s not found: %w", table, err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	count := 0
+	err = tableRef.Scan(func(r Record) bool {
+		count++
+		return true
+	})
+	if err != nil {
+		WriteError(w, fmt.Errorf("scan failed: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	w.WriteUint64(uint64(count))
+	WriteResp(w, Response{Success: true, Data: w.Bytes()})
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleCount(r *Reader, conn net.Conn) {
 	table, _ := r.ReadString()
 
-	s.mu.RLock()
-	tbl, exists := s.tables[table]
-	var count uint32
-	if exists {
-		count = uint32(len(tbl.records))
-	}
-	s.mu.RUnlock()
-
 	w := NewWriter(nil)
-	if !exists {
-		WriteError(w, fmt.Errorf("table %s not found", table))
-	} else {
-		data := make([]byte, 4)
-		binary.BigEndian.PutUint32(data, count)
-		WriteResponse(w, Response{Success: true, Data: data})
+
+	tableRef, err := s.getTable(table)
+	if err != nil {
+		WriteError(w, fmt.Errorf("table %s not found: %w", table, err))
+		conn.Write(w.Bytes())
+		return
 	}
-	w.WriteTo(conn)
+
+	count := uint32(tableRef.Count())
+	data := make([]byte, 4)
+	binary.BigEndian.PutUint32(data, count)
+	WriteResp(w, Response{Success: true, Data: data})
+	conn.Write(w.Bytes())
 }
 
-// TablePath returns the file path for a table
+func (s *Server) handleVacuum(r *Reader, conn net.Conn) {
+	w := NewWriter(nil)
+
+	if s.db == nil {
+		WriteError(w, fmt.Errorf("database not initialized"))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	if err := s.db.Vacuum(); err != nil {
+		WriteError(w, fmt.Errorf("vacuum failed: %w", err))
+		conn.Write(w.Bytes())
+		return
+	}
+
+	WriteResp(w, Response{Success: true, Data: []byte{}})
+	conn.Write(w.Bytes())
+}
+
 func (s *Server) TablePath(name string) string {
 	return filepath.Join(s.dataDir, name+".db")
 }
 
-// CreateTable initializes a new table
 func (s *Server) CreateTable(name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, exists := s.tables[name]; exists {
-		return nil
-	}
-
-	s.tables[name] = &tableData{name: name, records: make(map[uint32][]byte), nextID: 1}
-	return nil
+	_, err := s.getTable(name)
+	return err
 }
 
-// GetTable returns table data
-func (s *Server) GetTable(name string) (*tableData, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	t, ok := s.tables[name]
-	return t, ok
+func (s *Server) GetTable(name string) (any, bool) {
+	t, err := s.getTable(name)
+	return t, err == nil
 }
 
-// ListTables returns all table names
 func (s *Server) ListTables() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	return []string{}
+}
 
-	tables := make([]string, 0, len(s.tables))
-	for name := range s.tables {
-		tables = append(tables, name)
+func decodeValue(data []byte) (interface{}, error) {
+	if len(data) == 0 {
+		return nil, nil
 	}
-	return tables
+
+	firstByte := data[0]
+
+	switch firstByte {
+	case 'i', 0x00:
+		val, _, err := embeddb.DecodeVarint(data)
+		return val, err
+	case 'u':
+		val, _, err := embeddb.DecodeUvarint(data)
+		return val, err
+	case 'f':
+		val, _, err := embeddb.DecodeFloat64(data)
+		return val, err
+	case 's':
+		val, _, err := embeddb.DecodeString(data)
+		return val, err
+	case 'b':
+		val, _, err := embeddb.DecodeBool(data)
+		return val, err
+	default:
+		return nil, fmt.Errorf("unknown type marker: %c", firstByte)
+	}
 }
