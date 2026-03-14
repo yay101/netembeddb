@@ -84,8 +84,9 @@ import (
 )
 
 type User struct {
+    ID    uint32 `db:"id,primary"`
     Name  string
-    Age   int
+    Age   int    `db:"index"`
     Email string
 }
 
@@ -135,6 +136,32 @@ func main() {
         return
     }
     fmt.Println("Total records:", count)
+    
+    // Query records by indexed field (requires db:index tag on struct)
+    // Users with Age > 25
+    ids, err := client.QueryGT("users", "Age", 25, false)
+    if err != nil {
+        fmt.Println("QueryGT error:", err)
+    } else {
+        fmt.Println("Users older than 25:", len(ids))
+    }
+
+    // Query records with less than
+    ids, err = client.QueryLT("users", "Age", 30, true) // inclusive
+    if err != nil {
+        fmt.Println("QueryLT error:", err)
+    } else {
+        fmt.Println("Users age <= 30:", len(ids))
+    }
+
+    // Query records between values
+    ids, err = client.QueryBetween("users", "Age", 20, 40, true, true)
+    if err != nil {
+        fmt.Println("QueryBetween error:", err)
+    } else {
+        fmt.Println("Users age 20-40:", len(ids))
+    }
+
 
     // Note: Query operations (Query, QueryGT, QueryLT, QueryBetween) require
     // indexes on the server side and are currently placeholders.
@@ -158,10 +185,10 @@ func main() {
 | `OpGet` | 0x03 | Get a record by ID |
 | `OpUpdate` | 0x04 | Update an existing record |
 | `OpDelete` | 0x05 | Delete a record by ID |
-| `OpQuery` | 0x06 | Query records (placeholder) |
-| `OpQueryGT` | 0x07 | Query greater than (placeholder) |
-| `OpQueryLT` | 0x08 | Query less than (placeholder) |
-| `OpQueryBetween` | 0x09 | Query between (placeholder) |
+| `OpQuery` | 0x06 | Query records by exact field match |
+| `OpQueryGT` | 0x07 | Query records greater than value |
+| `OpQueryLT` | 0x08 | Query records less than value |
+| `OpQueryBetween` | 0x09 | Query records between two values |
 | `OpFilter` | 0x0A | Filter records |
 | `OpScan` | 0x0B | Scan all records |
 | `OpCount` | 0x0C | Count records in a table |
