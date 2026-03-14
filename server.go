@@ -19,6 +19,7 @@ type Server struct {
 	authKey string
 	ln      net.Listener
 	wg      sync.WaitGroup
+	tables  map[string]*embeddb.Table[GenericRecord]
 }
 
 type GenericRecord struct {
@@ -30,6 +31,7 @@ func NewServer(dataDir string, authKey string) *Server {
 	return &Server{
 		dataDir: dataDir,
 		authKey: authKey,
+		tables:  make(map[string]*embeddb.Table[GenericRecord]),
 	}
 }
 
@@ -95,17 +97,57 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) getTable(table string) (*embeddb.Table[GenericRecord], error) {
-	fmt.Printf("getTable: start table=%s\n", table)
-	result, err := embeddb.Use[GenericRecord](s.db, table)
-	fmt.Printf("getTable: done table=%s err=%v\n", table, err)
-	return result, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if tbl, ok := s.tables[table]; ok {
+		return tbl, nil
+	}
+
+	tbl, err := embeddb.Use[GenericRecord](s.db, table)
+	if err != nil {
+		return nil, err
+	}
+
+	s.tables[table] = tbl
+	return tbl, nil
+}
+
+func (s *Server) ensureTable(table string) (*embeddb.Table[GenericRecord], error) {
+	// First check without lock
+	if tbl, ok := s.tables[table]; ok {
+		return tbl, nil
+	}
+
+	// Need to get the table
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Double check after acquiring lock
+	if tbl, ok := s.tables[table]; ok {
+		return tbl, nil
+	}
+
+	return s.getTableLocked(table)
+}
+
+func (s *Server) getTableLocked(table string) (*embeddb.Table[GenericRecord], error) {
+	if tbl, ok := s.tables[table]; ok {
+		return tbl, nil
+	}
+
+	tbl, err := embeddb.Use[GenericRecord](s.db, table)
+	if err != nil {
+		return nil, err
+	}
+
+	s.tables[table] = tbl
+	return tbl, nil
 }
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
-
-	fmt.Printf("New connection from %v\n", conn.RemoteAddr())
 
 	if err := authenticateClient(conn, s.authKey); err != nil {
 		writeAuthResponse(conn, fmt.Errorf("auth failed: %w", err))
@@ -113,14 +155,11 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	writeAuthResponse(conn, nil)
 
-	r := NewReader(conn)
-
 	for {
-		fmt.Println("Waiting for op...")
+		r := NewReader(conn)
+
 		op, err := r.ReadByte()
-		fmt.Printf("Got op: %d\n", op)
 		if err != nil {
-			fmt.Printf("ReadByte error: %v\n", err)
 			return
 		}
 
@@ -199,22 +238,18 @@ func (s *Server) handleRegister(r *Reader, conn net.Conn) {
 
 func (s *Server) handleCreateTable(r *Reader, conn net.Conn) {
 	table, _ := r.ReadString()
-	fmt.Printf("handleCreateTable: table=%s\n", table)
 
 	w := NewWriter(nil)
 
 	_, err := s.getTable(table)
 	if err != nil {
-		fmt.Printf("handleCreateTable: getTable error=%v\n", err)
 		WriteError(w, fmt.Errorf("failed to create table: %w", err))
 		conn.Write(w.Bytes())
 		return
 	}
 
-	fmt.Printf("handleCreateTable: success, sending response\n")
 	WriteResp(w, Response{Success: true, Data: []byte{}})
-	n, err := conn.Write(w.Bytes())
-	fmt.Printf("handleCreateTable: wrote %d bytes, err=%v\n", n, err)
+	conn.Write(w.Bytes())
 }
 
 func (s *Server) handleListTables(r *Reader, conn net.Conn) {
@@ -459,21 +494,17 @@ func (s *Server) handleScan(r *Reader, conn net.Conn) {
 
 func (s *Server) handleCount(r *Reader, conn net.Conn) {
 	table, _ := r.ReadString()
-	fmt.Printf("handleCount: table=%s\n", table)
 
 	w := NewWriter(nil)
 
 	tableRef, err := s.getTable(table)
 	if err != nil {
-		fmt.Printf("handleCount: getTable error=%v\n", err)
 		WriteError(w, fmt.Errorf("table not found: %w", err))
 		conn.Write(w.Bytes())
 		return
 	}
 
-	fmt.Printf("handleCount: got tableRef, calling Count()\n")
 	count := uint32(tableRef.Count())
-	fmt.Printf("handleCount: count=%d\n", count)
 	data := make([]byte, 4)
 	binary.BigEndian.PutUint32(data, count)
 	WriteResp(w, Response{Success: true, Data: data})
