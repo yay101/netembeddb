@@ -5,6 +5,7 @@ import (
 	"net"
 
 	"github.com/yay101/embeddb"
+	embedcore "github.com/yay101/embeddbcore"
 	"github.com/yay101/netembeddb/protocol"
 )
 
@@ -752,23 +753,24 @@ func decodeValue(data []byte) interface{} {
 		return nil
 	}
 
-	first := data[0]
-
-	if first == 0x00 {
-		return false
-	}
-	if first == 0x01 && len(data) == 1 {
-		return true
-	}
-
-	if first&0x80 != 0 {
-		val, _ := decodeVarint(data)
+	val, _, err := embedcore.DecodeVarint(data)
+	if err == nil {
 		return val
 	}
 
-	length, n, _ := decodeUvarint(data)
-	if n > 0 && len(data) >= n+int(length) {
-		return string(data[n : n+int(length)])
+	val2, _, err := embedcore.DecodeUvarint(data)
+	if err == nil {
+		return val2
+	}
+
+	str, _, err := embedcore.DecodeString(data)
+	if err == nil {
+		return str
+	}
+
+	b, _, err := embedcore.DecodeBool(data)
+	if err == nil {
+		return b
 	}
 
 	return nil
