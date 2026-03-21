@@ -1,0 +1,4 @@
+github.com/yay101/embeddb v0.5.0 h1:tFYVjNVcnD4CPzSCt5qK4+loHpOwEwdbMgkfMWRMs0s=
+github.com/yay101/embeddb v0.5.0/go.mod h1:CviRWwjKKNcfErtvVyCUooMgQEE/oN44FQz7Ey2CJpg=
+golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 h1:fQsdNF2N+/YewlRZiricy4P1iimyPKZ/xwniHj8Q2a0=
+golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93/go.mod h1:EPRbTFwzwjXj9NpYyyrvenVh9Y+GFeEvMNh7Xuz7xgU=
