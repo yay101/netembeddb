@@ -185,8 +185,8 @@ func TestLocalMode(t *testing.T) {
 	}
 
 	count = table.Count()
-	if count != 2 {
-		t.Errorf("expected count 2 (includes deleted), got %d", count)
+	if count != 1 {
+		t.Errorf("expected count 1 after delete, got %d", count)
 	}
 
 	t.Log("Local mode tests passed")

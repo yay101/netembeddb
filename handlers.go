@@ -10,7 +10,7 @@ import (
 )
 
 type Record struct {
-	ID   uint32
+	ID   uint32 `db:"id,primary"`
 	Data []byte
 }
 
