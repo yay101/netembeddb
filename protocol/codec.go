@@ -35,10 +35,7 @@ const (
 	OpCreateIndex    OpCode = 0x15
 	OpDropIndex      OpCode = 0x16
 	OpGetIndexed     OpCode = 0x17
-	OpGetVersion     OpCode = 0x18
-	OpListVersions   OpCode = 0x19
 	OpBackup         OpCode = 0x1A
-	OpStats          OpCode = 0x1B
 	OpBegin          OpCode = 0x1C
 	OpCommit         OpCode = 0x1D
 	OpRollback       OpCode = 0x1E
