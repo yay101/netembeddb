@@ -60,6 +60,7 @@ users.Drop()
 | `Sync()` | Force flush to disk |
 | `Begin()` / `Commit()` / `Rollback()` | Transaction control |
 | `Backup(destPath)` | Create a backup |
+| `Stats()` → `(*protocol.StatsInfo, error)` | DB statistics (tables, file size, index keys) |
 
 ### `RemoteTable[T]`
 | Method | Description |

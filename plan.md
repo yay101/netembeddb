@@ -61,7 +61,7 @@
 
 - [x] `Begin`/`Commit`/`Rollback` transaction support (stub — embeddb transactions need refactoring for network use)
 - [x] `Backup` operation
-- [ ] `Stats` operation
+- [x] `Stats` operation
 - [x] `Drop` table operation
 - [ ] `GetVersion`/`ListVersions` versioning support
 - [x] `Upsert` operation
