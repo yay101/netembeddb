@@ -218,6 +218,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 			resp = s.handleRollback()
 		case protocol.OpBackup:
 			resp = s.handleBackup(data)
+		case protocol.OpStats:
+			resp = s.handleStats()
 		default:
 			resp = &protocol.Response{Success: false, Error: fmt.Sprintf("unknown op: %x", op)}
 		}
@@ -1012,6 +1014,32 @@ func (s *Server) handleBackup(data []byte) *protocol.Response {
 		return &protocol.Response{Success: false, Error: err.Error()}
 	}
 	return &protocol.Response{Success: true}
+}
+
+func (s *Server) handleStats() *protocol.Response {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dbStats := s.db.Stats()
+
+	tables := make([]protocol.TableStatsInfo, 0, len(dbStats.Tables))
+	for _, ts := range dbStats.Tables {
+		tables = append(tables, protocol.TableStatsInfo{
+			Name:        ts.Name,
+			RecordCount: ts.RecordCount,
+			TableID:     ts.TableID,
+		})
+	}
+
+	info := &protocol.StatsInfo{
+		Tables:     tables,
+		FileSize:   dbStats.FileSize,
+		WALSize:    dbStats.WALSize,
+		IndexKeys:  dbStats.IndexKeys,
+		BTreeDepth: dbStats.BTreeDepth,
+	}
+
+	return &protocol.Response{Success: true, Data: protocol.EncodeStats(info)}
 }
 
 func (s *Server) createSecondaryKeys(t *embeddb.Table[storedRecord], schema *registeredSchema, recData []byte, recordID uint32) {

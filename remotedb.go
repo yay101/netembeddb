@@ -91,6 +91,10 @@ func (r *RemoteDB) Backup(destPath string) error {
 	return r.client.Backup(destPath)
 }
 
+func (r *RemoteDB) Stats() (*protocol.StatsInfo, error) {
+	return r.client.Stats()
+}
+
 type RemoteTable[T any] struct {
 	remote    *RemoteDB
 	tableName string

@@ -357,3 +357,64 @@ func TestRemoteTable(t *testing.T) {
 		t.Fatalf("Drop failed: %v", err)
 	}
 }
+
+func TestStats(t *testing.T) {
+	tmpFile := "/tmp/netembeddb_stats_" + os.Getenv("USER") + ".db"
+	os.Remove(tmpFile)
+	defer os.Remove(tmpFile)
+
+	sockPath := "/tmp/netembeddb_stats_" + os.Getenv("USER") + ".sock"
+	os.Remove(sockPath)
+	defer os.Remove(sockPath)
+
+	server, err := NewServer(tmpFile)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
+	}
+	defer server.Close()
+
+	err = server.Listen("", sockPath)
+	if err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+
+	rdb, err := DialRemote(sockPath)
+	if err != nil {
+		t.Fatalf("DialRemote failed: %v", err)
+	}
+	defer rdb.Close()
+
+	table, err := Use[TestUser](rdb, "stats_users")
+	if err != nil {
+		t.Fatalf("Use failed: %v", err)
+	}
+
+	table.Insert(&TestUser{Name: "Alice", Email: "alice@example.com"})
+	table.Insert(&TestUser{Name: "Bob", Email: "bob@example.com"})
+
+	stats, err := rdb.Stats()
+	if err != nil {
+		t.Fatalf("Stats failed: %v", err)
+	}
+
+	found := false
+	for _, tbl := range stats.Tables {
+		if tbl.Name == "stats_users" {
+			found = true
+			if tbl.RecordCount != 2 {
+				t.Errorf("expected RecordCount 2, got %d", tbl.RecordCount)
+			}
+		}
+	}
+	if !found {
+		t.Error("stats_users table not found in stats")
+	}
+	if stats.FileSize == 0 {
+		t.Error("expected non-zero FileSize")
+	}
+
+	t.Logf("FileSize=%d, IndexKeys=%d, BTreeDepth=%d, Tables=%d",
+		stats.FileSize, stats.IndexKeys, stats.BTreeDepth, len(stats.Tables))
+
+	table.Drop()
+}

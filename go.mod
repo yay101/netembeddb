@@ -12,3 +12,7 @@ require (
 	github.com/yay101/embeddbmmap v0.1.2 // indirect
 	golang.org/x/sys v0.43.0 // indirect
 )
+
+replace github.com/yay101/embeddb => /home/dave/workspace/embeddb
+
+replace github.com/yay101/embeddbcore => /home/dave/workspace/embeddbcore

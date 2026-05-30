@@ -36,6 +36,7 @@ const (
 	OpDropIndex      OpCode = 0x16
 	OpGetIndexed     OpCode = 0x17
 	OpBackup         OpCode = 0x1A
+	OpStats          OpCode = 0x1B
 	OpBegin          OpCode = 0x1C
 	OpCommit         OpCode = 0x1D
 	OpRollback       OpCode = 0x1E
@@ -544,4 +545,100 @@ func DecodeFieldValueByKind(data []byte, kind reflect.Kind) (any, error) {
 	default:
 		return nil, fmt.Errorf("unsupported field kind: %v", kind)
 	}
+}
+
+type TableStatsInfo struct {
+	Name        string
+	RecordCount int
+	TableID     uint8
+}
+
+type StatsInfo struct {
+	Tables     []TableStatsInfo
+	FileSize   int64
+	WALSize    int64
+	IndexKeys  int
+	BTreeDepth int
+}
+
+func EncodeStats(stats *StatsInfo) []byte {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, EncodeUint64(uint64(len(stats.Tables)))...)
+	for _, t := range stats.Tables {
+		buf = append(buf, EncodeString(t.Name)...)
+		buf = append(buf, EncodeUint64(uint64(t.RecordCount))...)
+		buf = append(buf, t.TableID)
+	}
+	buf = append(buf, EncodeInt64(stats.FileSize)...)
+	buf = append(buf, EncodeInt64(stats.WALSize)...)
+	buf = append(buf, EncodeUint64(uint64(stats.IndexKeys))...)
+	buf = append(buf, EncodeUint64(uint64(stats.BTreeDepth))...)
+	return buf
+}
+
+func DecodeStats(data []byte) (*StatsInfo, error) {
+	pos := 0
+	tableCount, n, err := DecodeUint64(data[pos:])
+	if err != nil {
+		return nil, err
+	}
+	pos += n
+
+	tables := make([]TableStatsInfo, 0, tableCount)
+	for i := uint64(0); i < tableCount; i++ {
+		name, n, err := DecodeString(data[pos:])
+		if err != nil {
+			break
+		}
+		pos += n
+
+		count, n, err := DecodeUint64(data[pos:])
+		if err != nil {
+			break
+		}
+		pos += n
+
+		if pos >= len(data) {
+			break
+		}
+		tid := data[pos]
+		pos++
+
+		tables = append(tables, TableStatsInfo{
+			Name:        name,
+			RecordCount: int(count),
+			TableID:     tid,
+		})
+	}
+
+	fileSize, n, err := DecodeInt64(data[pos:])
+	if err != nil {
+		return nil, err
+	}
+	pos += n
+
+	walSize, n, err := DecodeInt64(data[pos:])
+	if err != nil {
+		return nil, err
+	}
+	pos += n
+
+	indexKeys, n, err := DecodeUint64(data[pos:])
+	if err != nil {
+		return nil, err
+	}
+	pos += n
+
+	btreeDepth, _, err := DecodeUint64(data[pos:])
+	if err != nil {
+		return nil, err
+	}
+
+	return &StatsInfo{
+		Tables:     tables,
+		FileSize:   fileSize,
+		WALSize:    walSize,
+		IndexKeys:  int(indexKeys),
+		BTreeDepth: int(btreeDepth),
+	}, nil
 }

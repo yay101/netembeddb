@@ -670,6 +670,22 @@ func (c *Client) Backup(destPath string) error {
 	return nil
 }
 
+func (c *Client) Stats() (*protocol.StatsInfo, error) {
+	if err := c.sendOp(protocol.OpStats, nil); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("stats failed: %s", resp.Error)
+	}
+
+	return protocol.DecodeStats(resp.Data)
+}
+
 func decodeUint32Slice(data []byte) ([]uint32, error) {
 	pos := 0
 	if pos+4 > len(data) {
