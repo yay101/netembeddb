@@ -1,626 +1,770 @@
 package netembeddb
 
 import (
-	"errors"
+	"encoding/binary"
 	"fmt"
 	"net"
+	"reflect"
 	"time"
 
+	embedcore "github.com/yay101/embeddbcore"
 	"github.com/yay101/netembeddb/protocol"
 )
 
 type Client struct {
-	conn net.Conn
+	conn    net.Conn
+	schemas map[string]*embedcore.StructLayout
 }
 
-func Dial(addr string) (*Client, error) {
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+type ClientOptions struct {
+	AuthKey string
+}
+
+func Dial(addr string, opts ...ClientOptions) (*Client, error) {
+	var authKey string
+	if len(opts) > 0 {
+		authKey = opts[0].AuthKey
+	}
+
+	var conn net.Conn
+	var err error
+
+	if len(addr) > 0 && addr[0] == '/' {
+		conn, err = net.DialTimeout("unix", addr, 5*time.Second)
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, 5*time.Second)
+	}
 	if err != nil {
-		if len(addr) > 0 && addr[0] == '/' {
-			conn, err = net.DialTimeout("unix", addr, 5*time.Second)
-			if err != nil {
-				return nil, fmt.Errorf("failed to connect: %w", err)
-			}
-		} else {
-			return nil, fmt.Errorf("failed to connect: %w", err)
+		return nil, fmt.Errorf("failed to connect: %w", err)
+	}
+
+	if authKey != "" {
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_, err := conn.Write([]byte(authKey))
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+
+		dec := protocol.NewDecoder(conn)
+		resp, err := dec.DecodeResponse()
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if !resp.Success {
+			conn.Close()
+			return nil, fmt.Errorf("authentication failed: %s", resp.Error)
 		}
 	}
 
-	client := &Client{conn: conn}
-	if err := client.readAuthResponse(); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	return client, nil
-}
-
-func (c *Client) readAuthResponse() error {
-	buf := make([]byte, 1)
-	c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	_, err := c.conn.Read(buf)
-	if err != nil {
-		return err
-	}
-	if buf[0] == 0 {
-		r := protocol.NewReader(c.conn)
-		errMsg, _ := r.ReadString()
-		return errors.New(errMsg)
-	}
-	return nil
+	return &Client{
+		conn:    conn,
+		schemas: make(map[string]*embedcore.StructLayout),
+	}, nil
 }
 
 func (c *Client) Close() error {
 	if c.conn == nil {
 		return nil
 	}
-	c.conn.Write([]byte{protocol.OpClose})
+	hdr := make([]byte, 5)
+	hdr[0] = byte(protocol.OpClose)
+	binary.BigEndian.PutUint32(hdr[1:5], 0)
+	c.conn.Write(hdr)
 	return c.conn.Close()
 }
 
-func (c *Client) Insert(table string, data []byte) (uint32, error) {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpInsert)
-	w.WriteString(table)
-	w.WriteBytes(data)
-
-	_, err := c.conn.Write(w.Bytes())
-	if err != nil {
-		return 0, err
-	}
-
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
-	if err != nil {
-		return 0, err
-	}
-	if !resp.Success {
-		return 0, errors.New(resp.Error)
-	}
-
-	reader := bytesToReader(resp.Data)
-	id, _ := reader.ReadUint64()
-	return uint32(id), nil
+func (c *Client) connReader() *protocol.Decoder {
+	return protocol.NewDecoder(c.conn)
 }
 
-func (c *Client) Get(table string, id uint32) ([]byte, error) {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpGet)
-	w.WriteString(table)
-	w.WriteUint64(uint64(id))
+func (c *Client) sendOp(op protocol.OpCode, payload []byte) error {
+	hdr := make([]byte, 5)
+	hdr[0] = byte(op)
+	binary.BigEndian.PutUint32(hdr[1:5], uint32(len(payload)))
 
-	_, err := c.conn.Write(w.Bytes())
-	if err != nil {
-		return nil, err
+	if _, err := c.conn.Write(hdr); err != nil {
+		return err
 	}
-
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
-	if err != nil {
-		return nil, err
+	if len(payload) > 0 {
+		if _, err := c.conn.Write(payload); err != nil {
+			return err
+		}
 	}
-	if !resp.Success {
-		return nil, errors.New(resp.Error)
-	}
-
-	reader := bytesToReader(resp.Data)
-	data, _ := reader.ReadBytes()
-	return data, nil
+	return nil
 }
 
-func (c *Client) Update(table string, id uint32, data []byte) error {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpUpdate)
-	w.WriteString(table)
-	w.WriteUint64(uint64(id))
-	w.WriteBytes(data)
+func (c *Client) RegisterSchema(tableName string, layout *embedcore.StructLayout) error {
+	c.schemas[tableName] = layout
 
-	_, err := c.conn.Write(w.Bytes())
-	if err != nil {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeString(layout.PrimaryKey)...)
+	buf = append(buf, byte(layout.PKType))
+
+	var indexableCount int
+	for _, field := range layout.Fields {
+		if !field.Primary && field.Offset > 0 && !field.IsSlice && !field.IsStruct {
+			indexableCount++
+		}
+	}
+	buf = append(buf, byte(indexableCount))
+
+	for _, field := range layout.Fields {
+		if !field.Primary && field.Offset > 0 && !field.IsSlice && !field.IsStruct {
+			buf = append(buf, protocol.EncodeString(field.Name)...)
+			buf = append(buf, protocol.EncodeString(field.Name)...)
+			buf = append(buf, protocol.EncodeUint64(uint64(field.Type))...)
+		}
+	}
+
+	if err := c.sendOp(protocol.OpRegisterSchema, buf); err != nil {
 		return err
 	}
 
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
+	dec := c.connReader()
+	resp, err := dec.DecodeResponse()
 	if err != nil {
 		return err
 	}
 	if !resp.Success {
-		return errors.New(resp.Error)
+		return fmt.Errorf("register schema failed: %s", resp.Error)
 	}
 
 	return nil
 }
 
-func (c *Client) Delete(table string, id uint32) error {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpDelete)
-	w.WriteString(table)
-	w.WriteUint64(uint64(id))
+func encodeTLVRecord(record any, layout *embedcore.StructLayout) ([]byte, error) {
+	buf := make([]byte, 0, 256)
+	for _, field := range layout.Fields {
+		if field.IsStruct && !field.IsTime && !field.IsSlice && !field.IsMap {
+			continue
+		}
+		if field.IsSlice || field.IsMap {
+			continue
+		}
 
-	_, err := c.conn.Write(w.Bytes())
+		val, err := embedcore.GetFieldValue(record, field)
+		if err != nil {
+			continue
+		}
+		if val == nil {
+			continue
+		}
+
+		fieldType := field.Type
+		if field.IsTime {
+			fieldType = reflect.Struct
+		}
+		encodedVal, err := protocol.EncodeFieldValue(val, fieldType)
+		if err != nil {
+			return nil, fmt.Errorf("encode field %s: %w", field.Name, err)
+		}
+
+		buf = embedcore.EncodeTLVField(buf, field.Name, encodedVal)
+	}
+	return buf, nil
+}
+
+func decodeTLVRecord(data []byte, layout *embedcore.StructLayout, result any) error {
+	remaining := data
+	for len(remaining) > 0 {
+		name, value, rem, err := embedcore.DecodeTLVField(remaining)
+		if err != nil {
+			break
+		}
+		remaining = rem
+
+		for _, field := range layout.Fields {
+			if field.Name == name {
+				decodedVal, err := protocol.DecodeFieldValueByKind(value, field.Type)
+				if err != nil {
+					continue
+				}
+				embedcore.SetFieldValue(result, field, decodedVal)
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Client) Insert(tableName string, data []byte) (uint32, error) {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, data...)
+
+	if err := c.sendOp(protocol.OpInsert, buf); err != nil {
+		return 0, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
 	if err != nil {
+		return 0, err
+	}
+	if !resp.Success {
+		return 0, fmt.Errorf("insert failed: %s", resp.Error)
+	}
+
+	if len(resp.Data) < 4 {
+		return 0, fmt.Errorf("invalid response data")
+	}
+	return binary.BigEndian.Uint32(resp.Data), nil
+}
+
+func (c *Client) Get(tableName string, id uint32) ([]byte, error) {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeUint32(id)...)
+
+	if err := c.sendOp(protocol.OpGet, buf); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("get failed: %s", resp.Error)
+	}
+
+	return resp.Data, nil
+}
+
+func (c *Client) Update(tableName string, id uint32, data []byte) error {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeUint32(id)...)
+	buf = append(buf, data...)
+
+	if err := c.sendOp(protocol.OpUpdate, buf); err != nil {
 		return err
 	}
 
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
+	resp, err := c.connReader().DecodeResponse()
 	if err != nil {
 		return err
 	}
 	if !resp.Success {
-		return errors.New(resp.Error)
+		return fmt.Errorf("update failed: %s", resp.Error)
 	}
 
 	return nil
 }
 
-func (c *Client) Query(table, field string, value interface{}) ([]uint32, error) {
-	valueData, err := encodeValue(value)
-	if err != nil {
-		return nil, err
+func (c *Client) Delete(tableName string, id uint32) error {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeUint32(id)...)
+
+	if err := c.sendOp(protocol.OpDelete, buf); err != nil {
+		return err
 	}
 
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpQuery)
-	w.WriteString(table)
-	w.WriteString(field)
-	w.WriteBytes(valueData)
-
-	_, err = c.conn.Write(w.Bytes())
+	resp, err := c.connReader().DecodeResponse()
 	if err != nil {
-		return nil, err
-	}
-
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
-	if err != nil {
-		return nil, err
+		return err
 	}
 	if !resp.Success {
-		return nil, errors.New(resp.Error)
+		return fmt.Errorf("delete failed: %s", resp.Error)
 	}
 
-	reader := bytesToReader(resp.Data)
-	count, _ := reader.ReadUint64()
-	ids := make([]uint32, count)
-	for i := uint64(0); i < count; i++ {
-		id, _ := reader.ReadUint64()
-		ids[i] = uint32(id)
-	}
-	return ids, nil
+	return nil
 }
 
-func (c *Client) QueryRangeGreaterThan(table, field string, min interface{}, inclusive bool) ([]uint32, error) {
-	minData, err := encodeValue(min)
-	if err != nil {
-		return nil, err
-	}
+func (c *Client) Count(tableName string) (uint64, error) {
+	buf := protocol.EncodeString(tableName)
 
-	flags := byte(0)
-	if inclusive {
-		flags |= byte(protocol.RangeMinInclusive)
-	}
-
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpQueryRange)
-	w.WriteString(table)
-	w.WriteString(field)
-	w.WriteByte(byte(protocol.QueryRangeGreaterThan))
-	w.WriteBytes(minData)
-	w.WriteBytes(nil)
-	w.WriteByte(flags)
-
-	_, err = c.conn.Write(w.Bytes())
-	if err != nil {
-		return nil, err
-	}
-
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
-	if err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, errors.New(resp.Error)
-	}
-
-	reader := bytesToReader(resp.Data)
-	count, _ := reader.ReadUint64()
-	ids := make([]uint32, count)
-	for i := uint64(0); i < count; i++ {
-		id, _ := reader.ReadUint64()
-		ids[i] = uint32(id)
-	}
-	return ids, nil
-}
-
-func (c *Client) QueryRangeLessThan(table, field string, max interface{}, inclusive bool) ([]uint32, error) {
-	maxData, err := encodeValue(max)
-	if err != nil {
-		return nil, err
-	}
-
-	flags := byte(0)
-	if inclusive {
-		flags |= byte(protocol.RangeMaxInclusive)
-	}
-
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpQueryRange)
-	w.WriteString(table)
-	w.WriteString(field)
-	w.WriteByte(byte(protocol.QueryRangeLessThan))
-	w.WriteBytes(nil)
-	w.WriteBytes(maxData)
-	w.WriteByte(flags)
-
-	_, err = c.conn.Write(w.Bytes())
-	if err != nil {
-		return nil, err
-	}
-
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
-	if err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, errors.New(resp.Error)
-	}
-
-	reader := bytesToReader(resp.Data)
-	count, _ := reader.ReadUint64()
-	ids := make([]uint32, count)
-	for i := uint64(0); i < count; i++ {
-		id, _ := reader.ReadUint64()
-		ids[i] = uint32(id)
-	}
-	return ids, nil
-}
-
-func (c *Client) QueryRangeBetween(table, field string, min, max interface{}, inclusiveMin, inclusiveMax bool) ([]uint32, error) {
-	minData, err := encodeValue(min)
-	if err != nil {
-		return nil, err
-	}
-
-	maxData, err := encodeValue(max)
-	if err != nil {
-		return nil, err
-	}
-
-	flags := byte(0)
-	if inclusiveMin {
-		flags |= byte(protocol.RangeMinInclusive)
-	}
-	if inclusiveMax {
-		flags |= byte(protocol.RangeMaxInclusive)
-	}
-
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpQueryRange)
-	w.WriteString(table)
-	w.WriteString(field)
-	w.WriteByte(byte(protocol.QueryRangeBetween))
-	w.WriteBytes(minData)
-	w.WriteBytes(maxData)
-	w.WriteByte(flags)
-
-	_, err = c.conn.Write(w.Bytes())
-	if err != nil {
-		return nil, err
-	}
-
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
-	if err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, errors.New(resp.Error)
-	}
-
-	reader := bytesToReader(resp.Data)
-	count, _ := reader.ReadUint64()
-	ids := make([]uint32, count)
-	for i := uint64(0); i < count; i++ {
-		id, _ := reader.ReadUint64()
-		ids[i] = uint32(id)
-	}
-	return ids, nil
-}
-
-func (c *Client) Scan(table string) ([][]byte, error) {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpScan)
-	w.WriteString(table)
-
-	_, err := c.conn.Write(w.Bytes())
-	if err != nil {
-		return nil, err
-	}
-
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
-	if err != nil {
-		return nil, err
-	}
-	if !resp.Success {
-		return nil, errors.New(resp.Error)
-	}
-
-	reader := bytesToReader(resp.Data)
-	count, _ := reader.ReadUint64()
-	records := make([][]byte, count)
-	for i := uint64(0); i < count; i++ {
-		data, _ := reader.ReadBytes()
-		records[i] = data
-	}
-	return records, nil
-}
-
-func (c *Client) Count(table string) (uint32, error) {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpCount)
-	w.WriteString(table)
-
-	_, err := c.conn.Write(w.Bytes())
-	if err != nil {
+	if err := c.sendOp(protocol.OpCount, buf); err != nil {
 		return 0, err
 	}
 
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
+	resp, err := c.connReader().DecodeResponse()
 	if err != nil {
 		return 0, err
 	}
 	if !resp.Success {
-		return 0, errors.New(resp.Error)
+		return 0, fmt.Errorf("count failed: %s", resp.Error)
 	}
 
-	reader := bytesToReader(resp.Data)
-	count, _ := reader.ReadUint64()
-	return uint32(count), nil
+	if len(resp.Data) < 8 {
+		return 0, fmt.Errorf("invalid response data")
+	}
+	return binary.BigEndian.Uint64(resp.Data), nil
+}
+
+func (c *Client) Upsert(tableName string, id uint32, data []byte) (uint32, bool, error) {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeUint32(id)...)
+	buf = append(buf, data...)
+
+	if err := c.sendOp(protocol.OpUpsert, buf); err != nil {
+		return 0, false, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return 0, false, err
+	}
+	if !resp.Success {
+		return 0, false, fmt.Errorf("upsert failed: %s", resp.Error)
+	}
+
+	if len(resp.Data) < 5 {
+		return 0, false, fmt.Errorf("invalid response data")
+	}
+	inserted := resp.Data[0] != 0
+	recordID := binary.BigEndian.Uint32(resp.Data[1:5])
+	return recordID, inserted, nil
+}
+
+func (c *Client) InsertMany(tableName string, records [][]byte) ([]uint32, error) {
+	buf := make([]byte, 0, 1024)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeUint64(uint64(len(records)))...)
+	for _, rec := range records {
+		buf = append(buf, protocol.EncodeBytes(rec)...)
+	}
+
+	if err := c.sendOp(protocol.OpInsertMany, buf); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("insertMany failed: %s", resp.Error)
+	}
+
+	return decodeUint32Slice(resp.Data)
+}
+
+func (c *Client) InsertManyBulk(tableName string, records [][]byte) ([]uint32, error) {
+	buf := make([]byte, 0, 1024)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeUint64(uint64(len(records)))...)
+	for _, rec := range records {
+		buf = append(buf, protocol.EncodeBytes(rec)...)
+	}
+
+	if err := c.sendOp(protocol.OpInsertManyBulk, buf); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("insertManyBulk failed: %s", resp.Error)
+	}
+
+	return decodeUint32Slice(resp.Data)
+}
+
+func (c *Client) DeleteMany(tableName string, ids []uint32) (int, error) {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeUint64(uint64(len(ids)))...)
+	for _, id := range ids {
+		buf = append(buf, protocol.EncodeUint32(id)...)
+	}
+
+	if err := c.sendOp(protocol.OpDeleteMany, buf); err != nil {
+		return 0, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return 0, err
+	}
+	if !resp.Success {
+		return 0, fmt.Errorf("deleteMany failed: %s", resp.Error)
+	}
+
+	if len(resp.Data) < 4 {
+		return 0, fmt.Errorf("invalid response data")
+	}
+	return int(binary.BigEndian.Uint32(resp.Data)), nil
+}
+
+func (c *Client) Query(tableName, fieldName string, value any) ([][]byte, error) {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeString(fieldName)...)
+	buf = append(buf, protocol.EncodeString(fmt.Sprintf("%v", value))...)
+
+	if err := c.sendOp(protocol.OpQuery, buf); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("query failed: %s", resp.Error)
+	}
+
+	return decodeBytesSlice(resp.Data)
+}
+
+func (c *Client) QueryRange(tableName, fieldName string, op string, value any, inclusive bool, maxValue any) ([][]byte, error) {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeString(fieldName)...)
+
+	var flags byte
+	switch op {
+	case "gt":
+		flags |= protocol.RangeFlagGT
+	case "lt":
+	default:
+	}
+	if inclusive {
+		flags |= protocol.RangeFlagIncl
+	}
+	if maxValue != nil {
+		flags |= protocol.RangeFlagBtwn
+	}
+	buf = append(buf, flags)
+	buf = append(buf, protocol.EncodeString(fmt.Sprintf("%v", value))...)
+	if maxValue != nil {
+		buf = append(buf, protocol.EncodeString(fmt.Sprintf("%v", maxValue))...)
+	}
+
+	if err := c.sendOp(protocol.OpQueryRange, buf); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("queryRange failed: %s", resp.Error)
+	}
+
+	return decodeBytesSlice(resp.Data)
+}
+
+func (c *Client) QueryLike(tableName, fieldName, pattern string) ([][]byte, error) {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeString(fieldName)...)
+	buf = append(buf, protocol.EncodeString(pattern)...)
+
+	if err := c.sendOp(protocol.OpQueryLike, buf); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("queryLike failed: %s", resp.Error)
+	}
+
+	return decodeBytesSlice(resp.Data)
+}
+
+func (c *Client) Scan(tableName string) ([][]byte, error) {
+	buf := protocol.EncodeString(tableName)
+
+	if err := c.sendOp(protocol.OpScan, buf); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("scan failed: %s", resp.Error)
+	}
+
+	return decodeBytesSlice(resp.Data)
+}
+
+func (c *Client) All(tableName string) ([][]byte, error) {
+	return c.Scan(tableName)
+}
+
+func (c *Client) Drop(tableName string) error {
+	buf := protocol.EncodeString(tableName)
+
+	if err := c.sendOp(protocol.OpDrop, buf); err != nil {
+		return err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("drop failed: %s", resp.Error)
+	}
+
+	return nil
+}
+
+func (c *Client) CreateIndex(tableName, fieldName string) error {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeString(fieldName)...)
+
+	if err := c.sendOp(protocol.OpCreateIndex, buf); err != nil {
+		return err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("createIndex failed: %s", resp.Error)
+	}
+
+	return nil
+}
+
+func (c *Client) DropIndex(tableName, fieldName string) error {
+	buf := make([]byte, 0, 256)
+	buf = append(buf, protocol.EncodeString(tableName)...)
+	buf = append(buf, protocol.EncodeString(fieldName)...)
+
+	if err := c.sendOp(protocol.OpDropIndex, buf); err != nil {
+		return err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("dropIndex failed: %s", resp.Error)
+	}
+
+	return nil
+}
+
+func (c *Client) GetIndexedFields(tableName string) ([]string, error) {
+	buf := protocol.EncodeString(tableName)
+
+	if err := c.sendOp(protocol.OpGetIndexed, buf); err != nil {
+		return nil, err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("getIndexedFields failed: %s", resp.Error)
+	}
+
+	return decodeStringSlice(resp.Data)
 }
 
 func (c *Client) Vacuum() error {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpVacuum)
-
-	_, err := c.conn.Write(w.Bytes())
-	if err != nil {
+	if err := c.sendOp(protocol.OpVacuum, nil); err != nil {
 		return err
 	}
 
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
+	resp, err := c.connReader().DecodeResponse()
 	if err != nil {
 		return err
 	}
 	if !resp.Success {
-		return errors.New(resp.Error)
+		return fmt.Errorf("vacuum failed: %s", resp.Error)
 	}
 
 	return nil
 }
 
-func (c *Client) CreateTable(table string) error {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpCreateTable)
-	w.WriteString(table)
-
-	_, err := c.conn.Write(w.Bytes())
-	if err != nil {
+func (c *Client) Sync() error {
+	if err := c.sendOp(protocol.OpSync, nil); err != nil {
 		return err
 	}
 
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
+	resp, err := c.connReader().DecodeResponse()
 	if err != nil {
 		return err
 	}
 	if !resp.Success {
-		return errors.New(resp.Error)
+		return fmt.Errorf("sync failed: %s", resp.Error)
 	}
 
 	return nil
 }
 
-func (c *Client) CreateIndex(table, field string) error {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpCreateIndex)
-	w.WriteString(table)
-	w.WriteString(field)
-
-	_, err := c.conn.Write(w.Bytes())
-	if err != nil {
+func (c *Client) Begin() error {
+	if err := c.sendOp(protocol.OpBegin, nil); err != nil {
 		return err
 	}
 
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
+	resp, err := c.connReader().DecodeResponse()
 	if err != nil {
 		return err
 	}
 	if !resp.Success {
-		return errors.New(resp.Error)
+		return fmt.Errorf("begin failed: %s", resp.Error)
 	}
 
 	return nil
 }
 
-func (c *Client) Filter(table, field string, op protocol.FilterOperator, value interface{}) ([]uint32, error) {
-	valueData, err := encodeValue(value)
-	if err != nil {
-		return nil, err
+func (c *Client) Commit() error {
+	if err := c.sendOp(protocol.OpCommit, nil); err != nil {
+		return err
 	}
 
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpFilter)
-	w.WriteString(table)
-	w.WriteString(field)
-	w.WriteByte(byte(op))
-	w.WriteBytes(valueData)
-
-	_, err = c.conn.Write(w.Bytes())
+	resp, err := c.connReader().DecodeResponse()
 	if err != nil {
-		return nil, err
-	}
-
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
-	if err != nil {
-		return nil, err
+		return err
 	}
 	if !resp.Success {
-		return nil, errors.New(resp.Error)
+		return fmt.Errorf("commit failed: %s", resp.Error)
 	}
 
-	reader := bytesToReader(resp.Data)
-	count, _ := reader.ReadUint64()
-	ids := make([]uint32, count)
-	for i := uint64(0); i < count; i++ {
-		id, _ := reader.ReadUint64()
-		ids[i] = uint32(id)
-	}
-	return ids, nil
+	return nil
 }
 
-type FilterPagedResult struct {
-	TotalCount uint32
-	HasMore    bool
-	Records    [][]byte
-}
-
-func (c *Client) FilterPaged(table, field string, op protocol.FilterOperator, value interface{}, offset, limit int) (*FilterPagedResult, error) {
-	valueData, err := encodeValue(value)
-	if err != nil {
-		return nil, err
+func (c *Client) Rollback() error {
+	if err := c.sendOp(protocol.OpRollback, nil); err != nil {
+		return err
 	}
 
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpFilterPaged)
-	w.WriteString(table)
-	w.WriteString(field)
-	w.WriteByte(byte(op))
-	w.WriteBytes(valueData)
-	w.WriteUint64(uint64(offset))
-	w.WriteUint64(uint64(limit))
-
-	_, err = c.conn.Write(w.Bytes())
+	resp, err := c.connReader().DecodeResponse()
 	if err != nil {
-		return nil, err
-	}
-
-	r := protocol.NewReader(c.conn)
-	resp, err := readResponse(r)
-	if err != nil {
-		return nil, err
+		return err
 	}
 	if !resp.Success {
-		return nil, errors.New(resp.Error)
+		return fmt.Errorf("rollback failed: %s", resp.Error)
 	}
 
-	reader := bytesToReader(resp.Data)
-	totalCount, _ := reader.ReadUint64()
-	hasMore, _ := reader.ReadBool()
-	recordCount, _ := reader.ReadUint64()
-
-	records := make([][]byte, recordCount)
-	for i := uint64(0); i < recordCount; i++ {
-		data, _ := reader.ReadBytes()
-		records[i] = data
-	}
-
-	return &FilterPagedResult{
-		TotalCount: uint32(totalCount),
-		HasMore:    hasMore,
-		Records:    records,
-	}, nil
+	return nil
 }
 
-func readResponse(r *protocol.Reader) (*Response, error) {
-	msgType, err := r.ReadByte()
+func (c *Client) Backup(destPath string) error {
+	buf := protocol.EncodeString(destPath)
+
+	if err := c.sendOp(protocol.OpBackup, buf); err != nil {
+		return err
+	}
+
+	resp, err := c.connReader().DecodeResponse()
+	if err != nil {
+		return err
+	}
+	if !resp.Success {
+		return fmt.Errorf("backup failed: %s", resp.Error)
+	}
+
+	return nil
+}
+
+func decodeUint32Slice(data []byte) ([]uint32, error) {
+	pos := 0
+	if pos+4 > len(data) {
+		return nil, fmt.Errorf("invalid data")
+	}
+	count := binary.BigEndian.Uint32(data[pos:])
+	pos += 4
+
+	results := make([]uint32, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if pos+4 > len(data) {
+			break
+		}
+		results = append(results, binary.BigEndian.Uint32(data[pos:]))
+		pos += 4
+	}
+	return results, nil
+}
+
+func decodeBytesSlice(data []byte) ([][]byte, error) {
+	pos := 0
+	if pos+4 > len(data) {
+		return nil, fmt.Errorf("invalid data")
+	}
+	count := binary.BigEndian.Uint32(data[pos:])
+	pos += 4
+
+	results := make([][]byte, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if pos+4 > len(data) {
+			break
+		}
+		recLen := binary.BigEndian.Uint32(data[pos:])
+		pos += 4
+		if recLen == 0 {
+			results = append(results, nil)
+			continue
+		}
+		if pos+int(recLen) > len(data) {
+			break
+		}
+		rec := make([]byte, recLen)
+		copy(rec, data[pos:pos+int(recLen)])
+		results = append(results, rec)
+		pos += int(recLen)
+	}
+	return results, nil
+}
+
+func decodeStringSlice(data []byte) ([]string, error) {
+	pos := 0
+	if pos+4 > len(data) {
+		return nil, fmt.Errorf("invalid data")
+	}
+	count := binary.BigEndian.Uint32(data[pos:])
+	pos += 4
+
+	results := make([]string, 0, count)
+	for i := uint32(0); i < count; i++ {
+		s, n, err := protocol.DecodeString(data[pos:])
+		if err != nil {
+			break
+		}
+		results = append(results, s)
+		pos += n
+	}
+	return results, nil
+}
+
+func encodeBytesSlice(records [][]byte) []byte {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, uint32(len(records)))
+	for _, rec := range records {
+		lenBytes := make([]byte, 4)
+		binary.BigEndian.PutUint32(lenBytes, uint32(len(rec)))
+		buf = append(buf, lenBytes...)
+		buf = append(buf, rec...)
+	}
+	return buf
+}
+
+func SchemaFromStruct[T any](name string) (*embedcore.StructLayout, error) {
+	var instance T
+	layout, err := embedcore.ComputeStructLayout(instance)
 	if err != nil {
 		return nil, err
 	}
-
-	resp := &Response{}
-
-	switch msgType {
-	case protocol.OpResponse:
-		resp.Success = true
-		resp.Data, _ = r.ReadBytes()
-	case protocol.OpError:
-		resp.Success = false
-		resp.Error, _ = r.ReadString()
-	default:
-		return nil, fmt.Errorf("unexpected message type: %d", msgType)
-	}
-
-	return resp, nil
+	_ = name
+	return layout, nil
 }
 
-func bytesToReader(data []byte) *protocol.Reader {
-	return protocol.NewReader(&byteReader{data: data})
+func EncodeRecord(record any, layout *embedcore.StructLayout) ([]byte, error) {
+	return encodeTLVRecord(record, layout)
 }
 
-type byteReader struct {
-	data []byte
-	pos  int
-}
-
-func (b *byteReader) Read(p []byte) (int, error) {
-	if b.pos >= len(b.data) {
-		return 0, fmt.Errorf("EOF")
-	}
-	n := copy(p, b.data[b.pos:])
-	b.pos += n
-	return n, nil
-}
-
-type Response struct {
-	Success bool
-	Data    []byte
-	Error   string
-}
-
-func encodeValue(value interface{}) ([]byte, error) {
-	w := protocol.NewWriter()
-
-	switch v := value.(type) {
-	case int:
-		w.WriteVarint(int64(v))
-	case int8:
-		w.WriteVarint(int64(v))
-	case int16:
-		w.WriteVarint(int64(v))
-	case int32:
-		w.WriteVarint(int64(v))
-	case int64:
-		w.WriteVarint(v)
-	case uint:
-		w.WriteUvarint(uint64(v))
-	case uint8:
-		w.WriteUvarint(uint64(v))
-	case uint16:
-		w.WriteUvarint(uint64(v))
-	case uint32:
-		w.WriteUvarint(uint64(v))
-	case uint64:
-		w.WriteUvarint(v)
-	case float32:
-		w.WriteFloat32(v)
-	case float64:
-		w.WriteFloat64(v)
-	case string:
-		w.WriteString(v)
-	case bool:
-		w.WriteBool(v)
-	default:
-		return nil, fmt.Errorf("unsupported type: %T", value)
-	}
-
-	return w.Bytes(), nil
+func DecodeRecord(data []byte, layout *embedcore.StructLayout, result any) error {
+	return decodeTLVRecord(data, layout, result)
 }

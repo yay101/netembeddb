@@ -1,265 +1,265 @@
 package netembeddb
 
 import (
-	"fmt"
-	"net"
-	"path/filepath"
-	"sync"
+	"os"
 	"testing"
-	"time"
-
-	"github.com/yay101/netembeddb/protocol"
 )
 
-func TestServerListen(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
-	sockPath := filepath.Join(tmpDir, "test.sock")
+type TestUser struct {
+	ID    uint32 `db:"id,primary"`
+	Name  string `db:"name"`
+	Email string `db:"email"`
+}
 
-	server := NewServer(dbPath, "")
-	err := server.Listen("", sockPath)
+type TestProduct struct {
+	ID    uint32  `db:"id,primary"`
+	Name  string  `db:"name"`
+	Price float64 `db:"price"`
+	Stock int     `db:"stock"`
+}
+
+func TestEncodeDecode(t *testing.T) {
+	layout, err := SchemaFromStruct[TestUser]("users")
 	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
+		t.Fatalf("SchemaFromStruct failed: %v", err)
+	}
+
+	record := &TestUser{
+		ID:    1,
+		Name:  "Alice",
+		Email: "alice@example.com",
+	}
+
+	encoded, err := EncodeRecord(record, layout)
+	if err != nil {
+		t.Fatalf("EncodeRecord failed: %v", err)
+	}
+
+	if len(encoded) == 0 {
+		t.Error("encoded data is empty")
+	}
+
+	decoded := &TestUser{}
+	err = DecodeRecord(encoded, layout, decoded)
+	if err != nil {
+		t.Fatalf("DecodeRecord failed: %v", err)
+	}
+
+	if decoded.ID != record.ID {
+		t.Errorf("ID mismatch: got %d, want %d", decoded.ID, record.ID)
+	}
+	if decoded.Name != record.Name {
+		t.Errorf("Name mismatch: got %s, want %s", decoded.Name, record.Name)
+	}
+}
+
+func TestServerClient(t *testing.T) {
+	tmpFile := "/tmp/netembeddb_test_" + os.Getenv("USER") + ".db"
+	os.Remove(tmpFile)
+	defer os.Remove(tmpFile)
+
+	sockPath := "/tmp/netembeddb_test_" + os.Getenv("USER") + ".sock"
+	os.Remove(sockPath)
+	defer os.Remove(sockPath)
+
+	server, err := NewServer(tmpFile)
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
 	}
 	defer server.Close()
 
-	time.Sleep(100 * time.Millisecond)
-
-	conn, err := net.Dial("unix", sockPath)
+	err = server.Listen("", sockPath)
 	if err != nil {
-		t.Fatalf("failed to connect: %v", err)
+		t.Fatalf("Listen failed: %v", err)
 	}
-	conn.Close()
-
-	t.Log("Server listening and accepting connections")
-}
-
-func TestServerWithTCP(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
-
-	server := NewServer(dbPath, "")
-	err := server.Listen("localhost:19999", "")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-	defer server.Close()
-
-	time.Sleep(100 * time.Millisecond)
-
-	conn, err := net.DialTimeout("tcp", "localhost:19999", time.Second)
-	if err != nil {
-		t.Fatalf("failed to connect: %v", err)
-	}
-	conn.Close()
-
-	t.Log("Server listening on TCP and accepting connections")
-}
-
-func TestClientInsertGet(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
-	sockPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewServer(dbPath, "")
-	err := server.Listen("", sockPath)
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		server.Wait()
-	}()
-
-	time.Sleep(100 * time.Millisecond)
 
 	client, err := Dial(sockPath)
 	if err != nil {
-		t.Fatalf("failed to dial: %v", err)
+		t.Fatalf("Dial failed: %v", err)
 	}
 	defer client.Close()
 
-	err = client.CreateTable("users")
+	layout, err := SchemaFromStruct[TestUser]("users")
 	if err != nil {
-		t.Fatalf("failed to create table: %v", err)
+		t.Fatalf("SchemaFromStruct failed: %v", err)
 	}
 
-	data := []byte(`{"name":"Alice","age":30}`)
-	id, err := client.Insert("users", data)
+	err = client.RegisterSchema("users", layout)
 	if err != nil {
-		t.Fatalf("failed to insert: %v", err)
-	}
-	t.Logf("Inserted record with ID: %d", id)
-
-	retrieved, err := client.Get("users", id)
-	if err != nil {
-		t.Fatalf("failed to get: %v", err)
+		t.Fatalf("RegisterSchema failed: %v", err)
 	}
 
-	if string(retrieved) != string(data) {
-		t.Errorf("expected %s, got %s", data, retrieved)
+	record := &TestUser{
+		ID:    1,
+		Name:  "Alice",
+		Email: "alice@example.com",
+	}
+
+	encoded, err := EncodeRecord(record, layout)
+	if err != nil {
+		t.Fatalf("EncodeRecord failed: %v", err)
+	}
+
+	id, err := client.Insert("users", encoded)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	if id != 1 {
+		t.Errorf("expected ID 1, got %d", id)
+	}
+
+	data, err := client.Get("users", id)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	decoded := &TestUser{}
+	err = DecodeRecord(data, layout, decoded)
+	if err != nil {
+		t.Fatalf("DecodeRecord failed: %v", err)
+	}
+
+	if decoded.Name != "Alice" {
+		t.Errorf("expected Name 'Alice', got '%s'", decoded.Name)
+	}
+
+	record2 := &TestUser{
+		ID:    1,
+		Name:  "Bob",
+		Email: "bob@example.com",
+	}
+	encoded2, _ := EncodeRecord(record2, layout)
+
+	err = client.Update("users", id, encoded2)
+	if err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+
+	data, err = client.Get("users", id)
+	if err != nil {
+		t.Fatalf("Get after update failed: %v", err)
+	}
+
+	decoded = &TestUser{}
+	DecodeRecord(data, layout, decoded)
+	if decoded.Name != "Bob" {
+		t.Errorf("expected Name 'Bob', got '%s'", decoded.Name)
 	}
 
 	count, err := client.Count("users")
 	if err != nil {
-		t.Fatalf("failed to count: %v", err)
+		t.Fatalf("Count failed: %v", err)
 	}
 	if count != 1 {
 		t.Errorf("expected count 1, got %d", count)
 	}
 
-	client.Close()
-	server.Close()
+	err = client.Delete("users", id)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	count, err = client.Count("users")
+	if err != nil {
+		t.Fatalf("Count after delete failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected count 0, got %d", count)
+	}
 }
 
-func TestProtocolCodec(t *testing.T) {
-	w := protocol.NewWriter()
-	w.WriteByte(protocol.OpInsert)
-	w.WriteString("users")
-	w.WriteBytes([]byte(`{"name":"Bob"}`))
+func TestRemoteTable(t *testing.T) {
+	tmpFile := "/tmp/netembeddb_remote_" + os.Getenv("USER") + ".db"
+	os.Remove(tmpFile)
+	defer os.Remove(tmpFile)
 
-	data := w.Bytes()
-	if len(data) < 3 {
-		t.Fatalf("expected at least 3 bytes, got %d", len(data))
-	}
+	sockPath := "/tmp/netembeddb_remote_" + os.Getenv("USER") + ".sock"
+	os.Remove(sockPath)
+	defer os.Remove(sockPath)
 
-	if data[0] != protocol.OpInsert {
-		t.Errorf("expected OpInsert (%d), got %d", protocol.OpInsert, data[0])
-	}
-
-	t.Logf("Encoded message: %v", data)
-}
-
-func TestLocalMode(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_local.db")
-
-	db, err := Open(dbPath)
+	server, err := NewServer(tmpFile)
 	if err != nil {
-		t.Fatalf("failed to open db: %v", err)
+		t.Fatalf("NewServer failed: %v", err)
 	}
-	defer db.Close()
+	defer server.Close()
 
-	err = db.CreateTable("users")
+	err = server.Listen("", sockPath)
 	if err != nil {
-		t.Fatalf("failed to create table: %v", err)
+		t.Fatalf("Listen failed: %v", err)
 	}
 
-	table, err := db.Use("users")
+	rdb, err := DialRemote(sockPath)
 	if err != nil {
-		t.Fatalf("failed to use table: %v", err)
+		t.Fatalf("DialRemote failed: %v", err)
 	}
+	defer rdb.Close()
 
-	id1, err := table.Insert([]byte(`{"name":"Alice","age":30}`))
+	products, err := Use[TestProduct](rdb, "products")
 	if err != nil {
-		t.Fatalf("failed to insert: %v", err)
-	}
-	if id1 == 0 {
-		t.Error("expected non-zero ID")
+		t.Fatalf("Use failed: %v", err)
 	}
 
-	_, err = table.Insert([]byte(`{"name":"Bob","age":25}`))
+	p1 := &TestProduct{Name: "Widget", Price: 9.99, Stock: 100}
+	id1, err := products.Insert(p1)
 	if err != nil {
-		t.Fatalf("failed to insert: %v", err)
+		t.Fatalf("Insert failed: %v", err)
+	}
+	if id1 != 1 {
+		t.Errorf("expected ID 1, got %d", id1)
 	}
 
-	data, err := table.Get(id1)
+	p2 := &TestProduct{Name: "Gadget", Price: 19.99, Stock: 50}
+	id2, err := products.Insert(p2)
 	if err != nil {
-		t.Fatalf("failed to get: %v", err)
+		t.Fatalf("Insert failed: %v", err)
 	}
-	if string(data) != `{"name":"Alice","age":30}` {
-		t.Errorf("expected Alice data, got %s", string(data))
+	if id2 != 2 {
+		t.Errorf("expected ID 2, got %d", id2)
 	}
 
-	count := table.Count()
+	result, err := products.Get(id1)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if result.Name != "Widget" {
+		t.Errorf("expected Name 'Widget', got '%s'", result.Name)
+	}
+
+	count, err := products.Count()
+	if err != nil {
+		t.Fatalf("Count failed: %v", err)
+	}
 	if count != 2 {
 		t.Errorf("expected count 2, got %d", count)
 	}
 
-	err = table.Delete(id1)
+	p1Update := &TestProduct{ID: id1, Name: "SuperWidget", Price: 14.99, Stock: 75}
+	err = products.Update(id1, p1Update)
 	if err != nil {
-		t.Fatalf("failed to delete: %v", err)
+		t.Fatalf("Update failed: %v", err)
 	}
 
-	count = table.Count()
-	if count != 1 {
-		t.Errorf("expected count 1 after delete, got %d", count)
-	}
-
-	t.Log("Local mode tests passed")
-}
-
-func TestClientConcurrent(t *testing.T) {
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_concurrent.db")
-	sockPath := filepath.Join(tmpDir, "test.sock")
-
-	server := NewServer(dbPath, "")
-	err := server.Listen("", sockPath)
+	result, err = products.Get(id1)
 	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
+		t.Fatalf("Get after update failed: %v", err)
 	}
-	defer server.Close()
+	if result.Name != "SuperWidget" {
+		t.Errorf("expected Name 'SuperWidget', got '%s'", result.Name)
+	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	setupClient, err := Dial(sockPath)
+	err = products.Delete(id2)
 	if err != nil {
-		t.Fatalf("failed to dial: %v", err)
+		t.Fatalf("Delete failed: %v", err)
 	}
 
-	err = setupClient.CreateTable("counters")
+	_, err = products.Get(id2)
+	if err == nil {
+		t.Error("expected error for deleted record, got nil")
+	}
+
+	err = products.Drop()
 	if err != nil {
-		t.Fatalf("failed to create table: %v", err)
+		t.Fatalf("Drop failed: %v", err)
 	}
-	setupClient.Close()
-
-	var wg sync.WaitGroup
-	numGoroutines := 10
-	insertsPerGoroutine := 50
-
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			client, err := Dial(sockPath)
-			if err != nil {
-				t.Errorf("dial failed: %v", err)
-				return
-			}
-			defer client.Close()
-
-			for j := 0; j < insertsPerGoroutine; j++ {
-				data := []byte(fmt.Sprintf(`{"id":%d,"value":%d}`, id, j))
-				_, err := client.Insert("counters", data)
-				if err != nil {
-					t.Errorf("insert failed: %v", err)
-					return
-				}
-			}
-		}(i)
-	}
-
-	wg.Wait()
-
-	countClient, err := Dial(sockPath)
-	if err != nil {
-		t.Fatalf("failed to dial: %v", err)
-	}
-	defer countClient.Close()
-
-	count, err := countClient.Count("counters")
-	if err != nil {
-		t.Fatalf("failed to count: %v", err)
-	}
-
-	expected := numGoroutines * insertsPerGoroutine
-	if count != uint32(expected) {
-		t.Errorf("expected %d records, got %d", expected, count)
-	}
-
-	t.Logf("Concurrent test passed: %d records inserted", count)
 }

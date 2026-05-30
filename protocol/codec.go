@@ -5,267 +5,546 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
+	"strconv"
+	"time"
 )
 
-type Writer struct {
-	buf []byte
+type OpCode byte
+
+const (
+	OpInsert         OpCode = 0x01
+	OpGet            OpCode = 0x02
+	OpUpdate         OpCode = 0x03
+	OpDelete         OpCode = 0x04
+	OpCount          OpCode = 0x05
+	OpRegisterSchema OpCode = 0x06
+	OpVacuum         OpCode = 0x07
+	OpSync           OpCode = 0x08
+	OpQuery          OpCode = 0x0A
+	OpQueryRange     OpCode = 0x0B
+	OpQueryLike      OpCode = 0x0C
+	OpUpsert         OpCode = 0x0D
+	OpInsertMany     OpCode = 0x0E
+	OpInsertManyBulk OpCode = 0x0F
+	OpDeleteMany     OpCode = 0x10
+	OpUpdateMany     OpCode = 0x11
+	OpScan           OpCode = 0x12
+	OpAll            OpCode = 0x13
+	OpDrop           OpCode = 0x14
+	OpCreateIndex    OpCode = 0x15
+	OpDropIndex      OpCode = 0x16
+	OpGetIndexed     OpCode = 0x17
+	OpGetVersion     OpCode = 0x18
+	OpListVersions   OpCode = 0x19
+	OpBackup         OpCode = 0x1A
+	OpStats          OpCode = 0x1B
+	OpBegin          OpCode = 0x1C
+	OpCommit         OpCode = 0x1D
+	OpRollback       OpCode = 0x1E
+	OpClose          OpCode = 0xFF
+)
+
+const (
+	RangeFlagGT   byte = 1 << 0
+	RangeFlagIncl byte = 1 << 1
+	RangeFlagBtwn byte = 1 << 2
+)
+
+type Response struct {
+	Success bool
+	Error   string
+	Data    []byte
 }
 
-func NewWriter() *Writer {
-	return &Writer{
-		buf: make([]byte, 0, 256),
-	}
+type Encoder struct {
+	w io.Writer
 }
 
-func (w *Writer) Reset() {
-	w.buf = w.buf[:0]
+func NewEncoder(w io.Writer) *Encoder {
+	return &Encoder{w: w}
 }
 
-func (w *Writer) Bytes() []byte {
-	return w.buf
-}
-
-func (w *Writer) WriteTo(wr io.Writer) (int64, error) {
-	n, err := wr.Write(encodeUvarint(uint64(len(w.buf))))
-	if err != nil {
-		return 0, err
-	}
-	m, err := wr.Write(w.buf)
-	return int64(n + m), err
-}
-
-func (w *Writer) WriteRaw(data []byte) (int64, error) {
-	w.buf = append(w.buf, data...)
-	return int64(len(data)), nil
-}
-
-func (w *Writer) WriteByte(b byte) error {
-	w.buf = append(w.buf, b)
-	return nil
-}
-
-func (w *Writer) WriteUvarint(v uint64) error {
-	for v >= 0x80 {
-		w.buf = append(w.buf, byte(v)|0x80)
-		v >>= 7
-	}
-	w.buf = append(w.buf, byte(v))
-	return nil
-}
-
-func (w *Writer) WriteVarint(v int64) error {
-	uv := uint64((v << 1) ^ (v >> 63))
-	return w.WriteUvarint(uv)
-}
-
-func (w *Writer) WriteString(s string) error {
-	if err := w.WriteUvarint(uint64(len(s))); err != nil {
-		return err
-	}
-	w.buf = append(w.buf, s...)
-	return nil
-}
-
-func (w *Writer) WriteBytes(data []byte) error {
-	if err := w.WriteUvarint(uint64(len(data))); err != nil {
-		return err
-	}
-	w.buf = append(w.buf, data...)
-	return nil
-}
-
-func (w *Writer) WriteFloat64(v float64) error {
-	return w.WriteUvarint(math.Float64bits(v))
-}
-
-func (w *Writer) WriteFloat32(v float32) error {
-	return w.WriteUvarint(uint64(math.Float32bits(v)))
-}
-
-func (w *Writer) WriteBool(v bool) error {
-	if v {
-		w.buf = append(w.buf, 1)
+func (e *Encoder) EncodeResponse(resp *Response) error {
+	hdr := make([]byte, 9)
+	if resp.Success {
+		hdr[0] = 1
+		binary.BigEndian.PutUint64(hdr[1:9], uint64(len(resp.Data)))
 	} else {
-		w.buf = append(w.buf, 0)
+		hdr[0] = 0
+		binary.BigEndian.PutUint64(hdr[1:9], uint64(len(resp.Error)))
 	}
+
+	if _, err := e.w.Write(hdr); err != nil {
+		return err
+	}
+
+	if resp.Success {
+		if len(resp.Data) > 0 {
+			if _, err := e.w.Write(resp.Data); err != nil {
+				return err
+			}
+		}
+	} else {
+		if len(resp.Error) > 0 {
+			if _, err := e.w.Write([]byte(resp.Error)); err != nil {
+				return err
+			}
+		}
+	}
+
 	return nil
 }
 
-func (w *Writer) WriteUint32(v uint32) (int64, error) {
-	var buf [4]byte
-	binary.BigEndian.PutUint32(buf[:], v)
-	return w.WriteRaw(buf[:])
+type Decoder struct {
+	r io.Reader
 }
 
-func (w *Writer) WriteUint64(v uint64) (int64, error) {
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], v)
-	return w.WriteRaw(buf[:])
+func NewDecoder(r io.Reader) *Decoder {
+	return &Decoder{r: r}
 }
 
-func encodeUvarint(v uint64) []byte {
-	var buf []byte
-	for v >= 0x80 {
-		buf = append(buf, byte(v)|0x80)
-		v >>= 7
+func (d *Decoder) DecodeResponse() (*Response, error) {
+	hdr := make([]byte, 9)
+	if _, err := io.ReadFull(d.r, hdr); err != nil {
+		return nil, err
 	}
-	buf = append(buf, byte(v))
+
+	resp := &Response{
+		Success: hdr[0] == 1,
+	}
+
+	dataLen := binary.BigEndian.Uint64(hdr[1:9])
+
+	if !resp.Success {
+		if dataLen > 0 {
+			errBuf := make([]byte, dataLen)
+			if _, err := io.ReadFull(d.r, errBuf); err != nil {
+				return nil, err
+			}
+			resp.Error = string(errBuf)
+		}
+	} else {
+		if dataLen > 0 {
+			resp.Data = make([]byte, dataLen)
+			if _, err := io.ReadFull(d.r, resp.Data); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return resp, nil
+}
+
+func EncodeString(s string) []byte {
+	buf := make([]byte, 4+len(s))
+	binary.BigEndian.PutUint32(buf, uint32(len(s)))
+	copy(buf[4:], s)
 	return buf
 }
 
-type Reader struct {
-	r   io.Reader
-	buf []byte
-	pos int
-}
-
-func NewReader(r io.Reader) *Reader {
-	return &Reader{
-		r:   r,
-		buf: make([]byte, 0, 4096),
+func DecodeString(data []byte) (string, int, error) {
+	if len(data) < 4 {
+		return "", 0, io.ErrUnexpectedEOF
 	}
-}
-
-func (r *Reader) fill() error {
-	if r.pos >= len(r.buf) {
-		r.buf = make([]byte, 0, 4096)
-		r.pos = 0
-		n, err := r.r.Read(r.buf[:cap(r.buf)])
-		if err != nil {
-			return err
-		}
-		r.buf = r.buf[:n]
+	n := binary.BigEndian.Uint32(data)
+	if int(n) > len(data)-4 {
+		return "", 0, io.ErrUnexpectedEOF
 	}
-	return nil
+	return string(data[4 : 4+n]), int(n) + 4, nil
 }
 
-func (r *Reader) ReadByte() (byte, error) {
-	if err := r.fill(); err != nil {
-		return 0, err
+func EncodeUint64(v uint64) []byte {
+	var enc [10]byte
+	n := binary.PutUvarint(enc[:], v)
+	return enc[:n]
+}
+
+func DecodeUint64(data []byte) (uint64, int, error) {
+	v, n := binary.Uvarint(data)
+	if n <= 0 {
+		return 0, 0, io.ErrUnexpectedEOF
 	}
-	b := r.buf[r.pos]
-	r.pos++
-	return b, nil
+	return v, n, nil
 }
 
-func (r *Reader) ReadUvarint() (uint64, error) {
-	var v uint64
-	var shift uint
-	for {
-		b, err := r.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		if b < 0x80 {
-			return v | uint64(b)<<shift, nil
-		}
-		v |= uint64(b&0x7F) << shift
-		shift += 7
-		if shift > 63 {
-			return 0, fmt.Errorf("varint overflow")
-		}
+func EncodeInt64(v int64) []byte {
+	ux := uint64(v) << 1
+	if v < 0 {
+		ux = ^ux
 	}
+	return EncodeUint64(ux)
 }
 
-func (r *Reader) ReadVarint() (int64, error) {
-	uv, err := r.ReadUvarint()
+func DecodeInt64(data []byte) (int64, int, error) {
+	ux, n, err := DecodeUint64(data)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return int64(uv>>1) ^ -(int64(uv & 1)), nil
+	x := int64(ux >> 1)
+	if ux&1 != 0 {
+		x = ^x
+	}
+	return x, n, nil
 }
 
-func (r *Reader) ReadString() (string, error) {
-	n, err := r.ReadUvarint()
-	if err != nil {
-		return "", err
-	}
-	if n == 0 {
-		return "", nil
-	}
+func EncodeFloat64(v float64) []byte {
+	return EncodeUint64(math.Float64bits(v))
+}
 
-	for r.pos+int(n) > len(r.buf) {
-		r.buf = append(r.buf, make([]byte, 256)...)
-		n2, err := r.r.Read(r.buf[len(r.buf)-256:])
-		if err != nil {
-			return "", err
+func DecodeFloat64(data []byte) (float64, int, error) {
+	v, n, err := DecodeUint64(data)
+	if err != nil {
+		return 0, 0, err
+	}
+	return math.Float64frombits(v), n, nil
+}
+
+func EncodeBytes(v []byte) []byte {
+	buf := make([]byte, 4+len(v))
+	binary.BigEndian.PutUint32(buf, uint32(len(v)))
+	copy(buf[4:], v)
+	return buf
+}
+
+func DecodeBytes(data []byte) ([]byte, int, error) {
+	if len(data) < 4 {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	n := binary.BigEndian.Uint32(data)
+	if int(n) > len(data)-4 {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	out := make([]byte, n)
+	copy(out, data[4:4+n])
+	return out, int(n) + 4, nil
+}
+
+func EncodeBool(v bool) []byte {
+	if v {
+		return []byte{1}
+	}
+	return []byte{0}
+}
+
+func DecodeBool(data []byte) (bool, int, error) {
+	if len(data) < 1 {
+		return false, 0, io.ErrUnexpectedEOF
+	}
+	return data[0] != 0, 1, nil
+}
+
+func EncodeUint32(v uint32) []byte {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, v)
+	return buf
+}
+
+func DecodeUint32(data []byte) (uint32, int, error) {
+	if len(data) < 4 {
+		return 0, 0, io.ErrUnexpectedEOF
+	}
+	return binary.BigEndian.Uint32(data), 4, nil
+}
+
+func EncodeUint32Varint(v uint32) []byte {
+	return EncodeUint64(uint64(v))
+}
+
+func DecodeUint32Varint(data []byte) (uint32, int, error) {
+	v, n, err := DecodeUint64(data)
+	return uint32(v), n, err
+}
+
+func EncodeTime(v time.Time) []byte {
+	return EncodeInt64(v.UnixNano())
+}
+
+func DecodeTime(data []byte) (time.Time, int, error) {
+	nano, n, err := DecodeInt64(data)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	return time.Unix(0, nano), n, nil
+}
+
+const (
+	FieldTypeInt    byte = 0x01
+	FieldTypeInt8   byte = 0x02
+	FieldTypeInt16  byte = 0x03
+	FieldTypeInt32  byte = 0x04
+	FieldTypeInt64  byte = 0x05
+	FieldTypeUint   byte = 0x06
+	FieldTypeUint8  byte = 0x07
+	FieldTypeUint16 byte = 0x08
+	FieldTypeUint32 byte = 0x09
+	FieldTypeUint64 byte = 0x0A
+	FieldTypeFloat32  byte = 0x0B
+	FieldTypeFloat64  byte = 0x0C
+	FieldTypeBool     byte = 0x0D
+	FieldTypeString   byte = 0x0E
+	FieldTypeTime     byte = 0x0F
+	FieldTypeBytes    byte = 0x10
+)
+
+func fieldTypeTag(kind reflect.Kind) byte {
+	switch kind {
+	case reflect.Int:
+		return FieldTypeInt
+	case reflect.Int8:
+		return FieldTypeInt8
+	case reflect.Int16:
+		return FieldTypeInt16
+	case reflect.Int32:
+		return FieldTypeInt32
+	case reflect.Int64:
+		return FieldTypeInt64
+	case reflect.Uint:
+		return FieldTypeUint
+	case reflect.Uint8:
+		return FieldTypeUint8
+	case reflect.Uint16:
+		return FieldTypeUint16
+	case reflect.Uint32:
+		return FieldTypeUint32
+	case reflect.Uint64:
+		return FieldTypeUint64
+	case reflect.Float32:
+		return FieldTypeFloat32
+	case reflect.Float64:
+		return FieldTypeFloat64
+	case reflect.Bool:
+		return FieldTypeBool
+	case reflect.String:
+		return FieldTypeString
+	default:
+		return 0
+	}
+}
+
+func EncodeFieldValue(v any, kind reflect.Kind) ([]byte, error) {
+	switch kind {
+	case reflect.Int:
+		tag := []byte{FieldTypeInt}
+		return append(tag, EncodeInt64(int64(v.(int)))...), nil
+	case reflect.Int8:
+		tag := []byte{FieldTypeInt8}
+		return append(tag, EncodeInt64(int64(v.(int8)))...), nil
+	case reflect.Int16:
+		tag := []byte{FieldTypeInt16}
+		return append(tag, EncodeInt64(int64(v.(int16)))...), nil
+	case reflect.Int32:
+		tag := []byte{FieldTypeInt32}
+		return append(tag, EncodeInt64(int64(v.(int32)))...), nil
+	case reflect.Int64:
+		tag := []byte{FieldTypeInt64}
+		return append(tag, EncodeInt64(v.(int64))...), nil
+	case reflect.Uint:
+		tag := []byte{FieldTypeUint}
+		return append(tag, EncodeUint64(uint64(v.(uint)))...), nil
+	case reflect.Uint8:
+		tag := []byte{FieldTypeUint8}
+		return append(tag, EncodeUint64(uint64(v.(uint8)))...), nil
+	case reflect.Uint16:
+		tag := []byte{FieldTypeUint16}
+		return append(tag, EncodeUint64(uint64(v.(uint16)))...), nil
+	case reflect.Uint32:
+		tag := []byte{FieldTypeUint32}
+		return append(tag, EncodeUint64(uint64(v.(uint32)))...), nil
+	case reflect.Uint64:
+		tag := []byte{FieldTypeUint64}
+		return append(tag, EncodeUint64(v.(uint64))...), nil
+	case reflect.Float32:
+		tag := []byte{FieldTypeFloat32}
+		return append(tag, EncodeFloat64(float64(v.(float32)))...), nil
+	case reflect.Float64:
+		tag := []byte{FieldTypeFloat64}
+		return append(tag, EncodeFloat64(v.(float64))...), nil
+	case reflect.Bool:
+		tag := []byte{FieldTypeBool}
+		return append(tag, EncodeBool(v.(bool))...), nil
+	case reflect.String:
+		tag := []byte{FieldTypeString}
+		return append(tag, EncodeString(v.(string))...), nil
+	case reflect.Struct:
+		if t, ok := v.(time.Time); ok {
+			tag := []byte{FieldTypeTime}
+			return append(tag, EncodeTime(t)...), nil
 		}
-		r.buf = r.buf[:len(r.buf)-256+n2]
+		return nil, fmt.Errorf("unsupported struct field type: %v", kind)
+	default:
+		return nil, fmt.Errorf("unsupported field kind: %v", kind)
 	}
-
-	s := string(r.buf[r.pos : r.pos+int(n)])
-	r.pos += int(n)
-	return s, nil
 }
 
-func (r *Reader) ReadBytes() ([]byte, error) {
-	n, err := r.ReadUvarint()
-	if err != nil {
-		return nil, err
+func DecodeFieldValue(data []byte) (any, error) {
+	if len(data) < 1 {
+		return nil, io.ErrUnexpectedEOF
 	}
-	if n == 0 {
-		return []byte{}, nil
-	}
+	tag := data[0]
+	payload := data[1:]
 
-	for r.pos+int(n) > len(r.buf) {
-		r.buf = append(r.buf, make([]byte, 256)...)
-		n2, err := r.r.Read(r.buf[len(r.buf)-256:])
-		if err != nil {
-			return nil, err
-		}
-		r.buf = r.buf[:len(r.buf)-256+n2]
+	switch tag {
+	case FieldTypeInt:
+		v, _, err := DecodeInt64(payload)
+		return int(v), err
+	case FieldTypeInt8:
+		v, _, err := DecodeInt64(payload)
+		return int8(v), err
+	case FieldTypeInt16:
+		v, _, err := DecodeInt64(payload)
+		return int16(v), err
+	case FieldTypeInt32:
+		v, _, err := DecodeInt64(payload)
+		return int32(v), err
+	case FieldTypeInt64:
+		v, _, err := DecodeInt64(payload)
+		return v, err
+	case FieldTypeUint:
+		v, _, err := DecodeUint64(payload)
+		return uint(v), err
+	case FieldTypeUint8:
+		v, _, err := DecodeUint64(payload)
+		return uint8(v), err
+	case FieldTypeUint16:
+		v, _, err := DecodeUint64(payload)
+		return uint16(v), err
+	case FieldTypeUint32:
+		v, _, err := DecodeUint64(payload)
+		return uint32(v), err
+	case FieldTypeUint64:
+		v, _, err := DecodeUint64(payload)
+		return v, err
+	case FieldTypeFloat32:
+		v, _, err := DecodeFloat64(payload)
+		return float32(v), err
+	case FieldTypeFloat64:
+		v, _, err := DecodeFloat64(payload)
+		return v, err
+	case FieldTypeBool:
+		v, _, err := DecodeBool(payload)
+		return v, err
+	case FieldTypeString:
+		v, _, err := DecodeString(payload)
+		return v, err
+	case FieldTypeTime:
+		v, _, err := DecodeTime(payload)
+		return v, err
+	default:
+		return nil, fmt.Errorf("unknown field type tag: 0x%x", tag)
 	}
-
-	b := make([]byte, n)
-	copy(b, r.buf[r.pos:r.pos+int(n)])
-	r.pos += int(n)
-	return b, nil
 }
 
-func (r *Reader) ReadFloat64() (float64, error) {
-	bits, err := r.ReadUvarint()
-	if err != nil {
-		return 0, err
+func DecodeFieldValueAsString(data []byte, kind reflect.Kind) string {
+	if len(data) < 1 {
+		return ""
 	}
-	return math.Float64frombits(bits), nil
+	payload := data[1:]
+
+	switch kind {
+	case reflect.Int:
+		v, _, _ := DecodeInt64(payload)
+		return strconv.FormatInt(v, 10)
+	case reflect.Int8:
+		v, _, _ := DecodeInt64(payload)
+		return strconv.FormatInt(v, 10)
+	case reflect.Int16:
+		v, _, _ := DecodeInt64(payload)
+		return strconv.FormatInt(v, 10)
+	case reflect.Int32:
+		v, _, _ := DecodeInt64(payload)
+		return strconv.FormatInt(v, 10)
+	case reflect.Int64:
+		v, _, _ := DecodeInt64(payload)
+		return strconv.FormatInt(v, 10)
+	case reflect.Uint:
+		v, _, _ := DecodeUint64(payload)
+		return strconv.FormatUint(v, 10)
+	case reflect.Uint8:
+		v, _, _ := DecodeUint64(payload)
+		return strconv.FormatUint(v, 10)
+	case reflect.Uint16:
+		v, _, _ := DecodeUint64(payload)
+		return strconv.FormatUint(v, 10)
+	case reflect.Uint32:
+		v, _, _ := DecodeUint64(payload)
+		return strconv.FormatUint(v, 10)
+	case reflect.Uint64:
+		v, _, _ := DecodeUint64(payload)
+		return strconv.FormatUint(v, 10)
+	case reflect.Float32:
+		v, _, _ := DecodeFloat64(payload)
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case reflect.Float64:
+		v, _, _ := DecodeFloat64(payload)
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	case reflect.Bool:
+		v, _, _ := DecodeBool(payload)
+		return strconv.FormatBool(v)
+	case reflect.String:
+		v, _, _ := DecodeString(payload)
+		return v
+	case reflect.Struct:
+		v, _, _ := DecodeTime(payload)
+		return strconv.FormatInt(v.UnixNano(), 10)
+	default:
+		return ""
+	}
 }
 
-func (r *Reader) ReadFloat32() (float32, error) {
-	bits, err := r.ReadUvarint()
-	if err != nil {
-		return 0, err
+func DecodeFieldValueByKind(data []byte, kind reflect.Kind) (any, error) {
+	if len(data) < 1 {
+		return nil, io.ErrUnexpectedEOF
 	}
-	return math.Float32frombits(uint32(bits)), nil
-}
+	payload := data[1:]
 
-func (r *Reader) ReadBool() (bool, error) {
-	b, err := r.ReadByte()
-	if err != nil {
-		return false, err
+	switch kind {
+	case reflect.Int:
+		v, _, err := DecodeInt64(payload)
+		return int(v), err
+	case reflect.Int8:
+		v, _, err := DecodeInt64(payload)
+		return int8(v), err
+	case reflect.Int16:
+		v, _, err := DecodeInt64(payload)
+		return int16(v), err
+	case reflect.Int32:
+		v, _, err := DecodeInt64(payload)
+		return int32(v), err
+	case reflect.Int64:
+		v, _, err := DecodeInt64(payload)
+		return v, err
+	case reflect.Uint:
+		v, _, err := DecodeUint64(payload)
+		return uint(v), err
+	case reflect.Uint8:
+		v, _, err := DecodeUint64(payload)
+		return uint8(v), err
+	case reflect.Uint16:
+		v, _, err := DecodeUint64(payload)
+		return uint16(v), err
+	case reflect.Uint32:
+		v, _, err := DecodeUint64(payload)
+		return uint32(v), err
+	case reflect.Uint64:
+		v, _, err := DecodeUint64(payload)
+		return v, err
+	case reflect.Float32:
+		v, _, err := DecodeFloat64(payload)
+		return float32(v), err
+	case reflect.Float64:
+		v, _, err := DecodeFloat64(payload)
+		return v, err
+	case reflect.Bool:
+		v, _, err := DecodeBool(payload)
+		return v, err
+	case reflect.String:
+		v, _, err := DecodeString(payload)
+		return v, err
+	case reflect.Struct:
+		v, _, err := DecodeTime(payload)
+		return v, err
+	default:
+		return nil, fmt.Errorf("unsupported field kind: %v", kind)
 	}
-	return b != 0, nil
-}
-
-func (r *Reader) ReadUint32() (uint32, error) {
-	if err := r.fill(); err != nil {
-		return 0, err
-	}
-	if len(r.buf)-r.pos < 4 {
-		return 0, fmt.Errorf("need 4 bytes")
-	}
-	v := binary.BigEndian.Uint32(r.buf[r.pos:])
-	r.pos += 4
-	return v, nil
-}
-
-func (r *Reader) ReadUint64() (uint64, error) {
-	if err := r.fill(); err != nil {
-		return 0, err
-	}
-	if len(r.buf)-r.pos < 8 {
-		return 0, fmt.Errorf("need 8 bytes")
-	}
-	v := binary.BigEndian.Uint64(r.buf[r.pos:])
-	r.pos += 8
-	return v, nil
 }
